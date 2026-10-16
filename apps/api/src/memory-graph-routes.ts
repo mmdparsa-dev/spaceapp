@@ -324,18 +324,23 @@ export function selectOverviewNodes(nodes: MemoryGraphNode[], edges: MemoryGraph
     members.get(edge.target)!.add(edge.source);
     if (edge.origin === "EXPLICIT_TAG") explicit.add(edge.target);
   }
-  const topicCap = Math.max(160, Math.round(limit * 0.08));
-  const sourceCap = Math.max(120, Math.round(limit * 0.06));
+  const topicCap = Math.min(limit, Math.max(1, Math.round(limit * 0.08)));
+  const sourceCap = Math.min(limit, Math.max(1, Math.round(limit * 0.06)));
   const topics = nodes.filter(node => members.has(node.id)).sort((a, b) =>
     Number(explicit.has(b.id)) - Number(explicit.has(a.id)) ||
     members.get(b.id)!.size - members.get(a.id)!.size || a.id.localeCompare(b.id)
   ).slice(0, topicCap);
   const sources = nodes.filter(node => node.type === "SOURCE").sort((a, b) => Number(isMemoryCoreFile(b.label)) - Number(isMemoryCoreFile(a.label)) || a.id.localeCompare(b.id)).slice(0, sourceCap);
-  const selected = new Map([...sources, ...topics].map(node => [node.id, node]));
+  const selected = new Map<string, MemoryGraphNode>();
+  for (const node of [...sources, ...topics]) {
+    if (selected.size >= limit) break;
+    selected.set(node.id, node);
+  }
   // Give every reserved topic a real visible neighbor, even for sparse explicit tags.
   for (const topic of topics) {
+    if (selected.size >= limit) break;
     const first = [...members.get(topic.id)!].sort()[0];
-    if (first) selected.set(first, byId.get(first)!);
+    if (first && byId.has(first)) selected.set(first, byId.get(first)!);
   }
   for (const node of nodes) {
     if (selected.size >= limit) break;
