@@ -34,6 +34,9 @@ export function createMemoryGraphSnapshotStore(options: CreateMemoryGraphSnapsho
     }
     try {
       await directoryHandle.sync();
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "EPERM" || (e as NodeJS.ErrnoException).code === "EINVAL" || (e as NodeJS.ErrnoException).code === "EISDIR") return;
+      throw e;
     } finally {
       await directoryHandle.close();
     }
