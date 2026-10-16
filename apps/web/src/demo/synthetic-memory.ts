@@ -33,12 +33,12 @@ export function generateSyntheticMemoryGraph(nodeCount: number = 2000): MemoryGr
   const edges: MemoryGraphEdge[] = [];
   const edgeSet = new Set<string>();
 
-  // 1. Root core source node (Workspace Core)
+  // 1. Root core source node (space.md)
   const rootNode: MemoryGraphNode = {
     id: "source:core",
-    label: "Workspace Core",
+    label: "space.md",
     type: "SOURCE",
-    sourcePath: "/workspace/core.md",
+    sourcePath: "/workspace/space.md",
     recordId: null
   };
   nodes.push(rootNode);
@@ -102,13 +102,26 @@ export function generateSyntheticMemoryGraph(nodeCount: number = 2000): MemoryGr
     }
   }
 
-  // 5. Connect memory nodes to topics
+  // 5. Connect memory nodes to topics via TAGGED_WITH (ensuring at least 2 memories per topic so createMemoryAtlas keeps it)
+  for (let t = 0; t < topicNodes.length; t++) {
+    const topic = topicNodes[t]!;
+    const mem1 = memoryNodes[(t * 2) % memoryNodes.length]!;
+    const mem2 = memoryNodes[(t * 2 + 1) % memoryNodes.length]!;
+    for (const mem of [mem1, mem2]) {
+      const edgeKey = `${mem.id}->${topic.id}`;
+      if (!edgeSet.has(edgeKey)) {
+        edges.push({ id: `edge:tag-init-${edges.length}`, source: mem.id, target: topic.id, type: "TAGGED_WITH" });
+        edgeSet.add(edgeKey);
+      }
+    }
+  }
+
   for (let i = 0; i < memoryNodes.length; i++) {
     const mem = memoryNodes[i]!;
     const topic = topicNodes[Math.floor(rng() * topicNodes.length)]!;
     const edgeKey = `${mem.id}->${topic.id}`;
     if (!edgeSet.has(edgeKey)) {
-      edges.push({ id: `edge:mem-top-${i}`, source: mem.id, target: topic.id, type: "DERIVED_FROM" });
+      edges.push({ id: `edge:mem-top-${i}`, source: mem.id, target: topic.id, type: "TAGGED_WITH" });
       edgeSet.add(edgeKey);
     }
   }

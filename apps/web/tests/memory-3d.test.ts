@@ -9,6 +9,8 @@ import {
   type MemoryPoint3D
 } from "../src/features/memory-workspace/memory-3d.js";
 import { generateSyntheticMemoryGraph } from "../src/demo/synthetic-memory.js";
+import { createMemoryAtlas } from "../src/features/memory-workspace/memory-atlas.js";
+import { isMemoryCoreLabel } from "../src/features/memory-workspace/memory-graph-visuals.js";
 import type { MemoryGraphNode, MemoryGraphEdge } from "@space/contracts";
 
 describe("3D memory projection", () => {
@@ -236,7 +238,7 @@ describe("3D memory projection", () => {
     expect(graph2k.nodes.length).toBe(2_000);
     expect(graph2k.edges.length).toBeGreaterThanOrEqual(5_900);
     expect(graph2k.edges.length).toBeLessThanOrEqual(6_100);
-    expect(graph2k.nodes[0]!.label).toBe("Workspace Core");
+    expect(graph2k.nodes[0]!.label).toBe("space.md");
 
     const graph10k = generateSyntheticMemoryGraph(10_000);
     expect(graph10k.nodes.length).toBe(10_000);
@@ -250,5 +252,10 @@ describe("3D memory projection", () => {
     const repeat2k = generateSyntheticMemoryGraph(2_000);
     expect(repeat2k.nodes[10]!.id).toBe(graph2k.nodes[10]!.id);
     expect(repeat2k.edges[100]!.id).toBe(graph2k.edges[100]!.id);
+
+    // Verify createMemoryAtlas preserves all nodes including topics and core
+    const atlas2k = createMemoryAtlas(graph2k.nodes, graph2k.edges, false);
+    expect(atlas2k.nodes.length).toBe(2_000);
+    expect(atlas2k.nodes.some(n => isMemoryCoreLabel(n.label))).toBe(true);
   });
 });
