@@ -259,82 +259,6 @@ void main() {
 }
 `;
 
-// Picking vertex shader: encodes 1-based node index into RGB
-const PICK_VS = `#version 300 es
-precision highp float;
-
-layout(location = 0) in vec2 aQuadCoord;
-layout(location = 1) in vec3 aNodePos;
-layout(location = 2) in vec2 aPickParams; // x: baseR, y: nodeIndex (1-based)
-
-uniform float uYaw;
-uniform float uPitch;
-uniform float uZoom;
-uniform float uScale;
-uniform vec2 uViewport;
-uniform float uExtent;
-
-out vec2 vQuadCoord;
-out float vHitRadius;
-flat out uint vNodeIndex;
-
-void main() {
-  float cosYaw = cos(uYaw);
-  float sinYaw = sin(uYaw);
-  float rx = aNodePos.x * cosYaw + aNodePos.z * sinYaw;
-  float depth = -aNodePos.x * sinYaw + aNodePos.z * cosYaw;
-
-  float cosPitch = cos(uPitch);
-  float sinPitch = sin(uPitch);
-  float ry = aNodePos.y * cosPitch - depth * sinPitch;
-  float rz = aNodePos.y * sinPitch + depth * cosPitch;
-
-  float perspective = 650.0 / max(120.0, 650.0 + rz * uScale);
-
-  vec2 screenCenter = vec2(
-    uViewport.x * 0.5 + rx * uScale * uZoom * perspective,
-    uViewport.y * 0.5 - ry * uScale * uZoom * perspective
-  );
-
-  float baseR = aPickParams.x;
-  float radius = max(1.0, baseR * perspective * sqrt(uZoom));
-  float hitR = max(7.0, radius + 3.0);
-
-  vec2 screenPos = screenCenter + aQuadCoord * hitR;
-  vec2 ndcPos = vec2(
-    (screenPos.x / uViewport.x) * 2.0 - 1.0,
-    1.0 - (screenPos.y / uViewport.y) * 2.0
-  );
-
-  float ndcZ = clamp(rz / (3.0 * uExtent) - 0.002, -0.999, 0.999);
-  gl_Position = vec4(ndcPos, ndcZ, 1.0);
-
-  vQuadCoord = aQuadCoord * hitR;
-  vHitRadius = hitR;
-  vNodeIndex = uint(aPickParams.y);
-}
-`;
-
-const PICK_FS = `#version 300 es
-precision highp float;
-
-in vec2 vQuadCoord;
-in float vHitRadius;
-flat in uint vNodeIndex;
-
-out vec4 fragColor;
-
-void main() {
-  if (length(vQuadCoord) > vHitRadius) {
-    discard;
-  }
-  float r = float(vNodeIndex & 255u) / 255.0;
-  float g = float((vNodeIndex >> 8u) & 255u) / 255.0;
-  float b = float((vNodeIndex >> 16u) & 255u) / 255.0;
-  fragColor = vec4(r, g, b, 1.0);
-}
-`;
-
 export function MemoryGraph3D({
   nodes,
   edges,
@@ -382,6 +306,10 @@ export function MemoryGraph3D({
     redrawRef.current();
   }, [resetToken]);
 
+  useEffect(() => {
+    redrawRef.current();
+  }, [nodes, edges, positions, coordinates, showTitles, selectedNodeId]);
+
   // Test WebGL2 support
   useEffect(() => {
     if (typeof HTMLCanvasElement === "undefined") {
@@ -422,11 +350,11 @@ export function MemoryGraph3D({
 
     let nodeProgram: WebGLProgram | null = null;
     let edgeProgram: WebGLProgram | null = null;
-    let pickProgram: WebGLProgram | null = null;
 
     let quadVao: WebGLVertexArrayObject | null = null;
-    let quadBuffer: WebGLBuffer | null = null;
+    let edgeVao: WebGLVertexArrayObject | null = null;
 
+    let quadBuffer: WebGLBuffer | null = null;
     let nodePosBuffer: WebGLBuffer | null = null;
     let nodeColorBuffer: WebGLBuffer | null = null;
     let nodeParamsBuffer: WebGLBuffer | null = null;
@@ -434,49 +362,53 @@ export function MemoryGraph3D({
     let edgePosBuffer: WebGLBuffer | null = null;
     let edgeParamBuffer: WebGLBuffer | null = null;
 
-    let pickParamsBuffer: WebGLBuffer | null = null;
-    let pickFbo: WebGLFramebuffer | null = null;
-    let pickColorRb: WebGLRenderbuffer | null = null;
-    let pickDepthRb: WebGLRenderbuffer | null = null;
-
     try {
       nodeProgram = createProgram(gl, NODE_VS, NODE_FS);
       edgeProgram = createProgram(gl, EDGE_VS, EDGE_FS);
-      pickProgram = createProgram(gl, PICK_VS, PICK_FS);
 
-      // Quad buffer for instanced billboard rendering
+      // Node billboard quad VAO
       quadVao = gl.createVertexArray();
       quadBuffer = gl.createBuffer();
+      nodePosBuffer = gl.createBuffer();
+      nodeColorBuffer = gl.createBuffer();
+      nodeParamsBuffer = gl.createBuffer();
+
       gl.bindVertexArray(quadVao);
       gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
       gl.enableVertexAttribArray(0);
       gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 
-      // Node instance buffers
-      nodePosBuffer = gl.createBuffer();
-      nodeColorBuffer = gl.createBuffer();
-      nodeParamsBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, nodePosBuffer);
+      gl.enableVertexAttribArray(1);
+      gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+      gl.vertexAttribDivisor(1, 1);
 
-      // Edge buffers
+      gl.bindBuffer(gl.ARRAY_BUFFER, nodeColorBuffer);
+      gl.enableVertexAttribArray(2);
+      gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 0, 0);
+      gl.vertexAttribDivisor(2, 1);
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, nodeParamsBuffer);
+      gl.enableVertexAttribArray(3);
+      gl.vertexAttribPointer(3, 4, gl.FLOAT, false, 0, 0);
+      gl.vertexAttribDivisor(3, 1);
+      gl.bindVertexArray(null);
+
+      // Edge lines VAO
+      edgeVao = gl.createVertexArray();
       edgePosBuffer = gl.createBuffer();
       edgeParamBuffer = gl.createBuffer();
 
-      // Picking buffers & FBO
-      pickParamsBuffer = gl.createBuffer();
-      pickFbo = gl.createFramebuffer();
-      pickColorRb = gl.createRenderbuffer();
-      pickDepthRb = gl.createRenderbuffer();
+      gl.bindVertexArray(edgeVao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, edgePosBuffer);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
 
-      gl.bindFramebuffer(gl.FRAMEBUFFER, pickFbo);
-      gl.bindRenderbuffer(gl.RENDERBUFFER, pickColorRb);
-      gl.renderbufferStorage(gl.RENDERBUFFER, gl.RGBA8, 1, 1);
-      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, pickColorRb);
-
-      gl.bindRenderbuffer(gl.RENDERBUFFER, pickDepthRb);
-      gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, 1, 1);
-      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, pickDepthRb);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.bindBuffer(gl.ARRAY_BUFFER, edgeParamBuffer);
+      gl.enableVertexAttribArray(1);
+      gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 0, 0);
+      gl.bindVertexArray(null);
     } catch {
       setUseFallback(true);
       return;
@@ -489,105 +421,159 @@ export function MemoryGraph3D({
     let hover: string | null = null;
     let spatialIndex: SpatialPickingIndex | null = null;
 
+    let lastPickYaw = NaN;
+    let lastPickPitch = NaN;
+    let lastPickZoom = NaN;
+    let lastPickScale = NaN;
+    let lastPickWidth = NaN;
+    let lastPickHeight = NaN;
+
     const pointers = new Map<number, { x: number; y: number }>();
     let dragged = false;
     let downX = 0;
     let downY = 0;
 
+    let lastNodes: MemoryGraphNode[] | null = null;
+    let lastEdges: MemoryGraphEdge[] | null = null;
+    let lastPositions: Map<string, MemoryAtlasPosition> | null = null;
+    let lastCoordinates: Map<string, MemoryPoint3D> | null = null;
+    let lastFocus: string | null = null;
+    let focusDirty = true;
+
+    let validNodes: MemoryGraphNode[] = [];
+    let validEdges: MemoryGraphEdge[] = [];
     let cachedNodeCount = 0;
     let cachedEdgeVertexCount = 0;
+
+    const updateDataBuffers = () => {
+      const { nodes, edges, positions, coordinates } = current.current;
+      validNodes = [];
+      for (let i = 0; i < nodes.length; i++) {
+        const node = nodes[i]!;
+        if (coordinates.has(node.id)) validNodes.push(node);
+      }
+      cachedNodeCount = validNodes.length;
+
+      const posData = new Float32Array(validNodes.length * 3);
+      const colorData = new Float32Array(validNodes.length * 4);
+      for (let i = 0; i < validNodes.length; i++) {
+        const node = validNodes[i]!;
+        const c = coordinates.get(node.id)!;
+        posData[i * 3] = c.x;
+        posData[i * 3 + 1] = c.y;
+        posData[i * 3 + 2] = c.z;
+
+        const col = parseHexColor(positions.get(node.id)?.color);
+        colorData[i * 4] = col[0]!;
+        colorData[i * 4 + 1] = col[1]!;
+        colorData[i * 4 + 2] = col[2]!;
+        colorData[i * 4 + 3] = col[3]!;
+      }
+
+      gl!.bindBuffer(gl!.ARRAY_BUFFER, nodePosBuffer);
+      gl!.bufferData(gl!.ARRAY_BUFFER, posData, gl!.DYNAMIC_DRAW);
+
+      gl!.bindBuffer(gl!.ARRAY_BUFFER, nodeColorBuffer);
+      gl!.bufferData(gl!.ARRAY_BUFFER, colorData, gl!.DYNAMIC_DRAW);
+
+      validEdges = [];
+      for (let i = 0; i < edges.length; i++) {
+        const edge = edges[i]!;
+        if (coordinates.has(edge.source) && coordinates.has(edge.target)) {
+          validEdges.push(edge);
+        }
+      }
+      cachedEdgeVertexCount = validEdges.length * 2;
+
+      const edgePosData = new Float32Array(validEdges.length * 6);
+      for (let i = 0; i < validEdges.length; i++) {
+        const edge = validEdges[i]!;
+        const c1 = coordinates.get(edge.source)!;
+        const c2 = coordinates.get(edge.target)!;
+        edgePosData[i * 6] = c1.x;
+        edgePosData[i * 6 + 1] = c1.y;
+        edgePosData[i * 6 + 2] = c1.z;
+        edgePosData[i * 6 + 3] = c2.x;
+        edgePosData[i * 6 + 4] = c2.y;
+        edgePosData[i * 6 + 5] = c2.z;
+      }
+
+      gl!.bindBuffer(gl!.ARRAY_BUFFER, edgePosBuffer);
+      gl!.bufferData(gl!.ARRAY_BUFFER, edgePosData, gl!.DYNAMIC_DRAW);
+
+      lastNodes = nodes;
+      lastEdges = edges;
+      lastPositions = positions;
+      lastCoordinates = coordinates;
+      focusDirty = true;
+      spatialIndex = null;
+    };
+
+    const updateFocusBuffers = (focus: string | null) => {
+      const neighbors = new Set<string>();
+      if (focus) {
+        for (let i = 0; i < validEdges.length; i++) {
+          const edge = validEdges[i]!;
+          if (edge.source === focus) neighbors.add(edge.target);
+          if (edge.target === focus) neighbors.add(edge.source);
+        }
+      }
+
+      const nodeParamsData = new Float32Array(validNodes.length * 4);
+      for (let i = 0; i < validNodes.length; i++) {
+        const node = validNodes[i]!;
+        const isCore = node.type === "SOURCE" && isMemoryCoreLabel(node.label);
+        const baseR = isCore ? 10.0 : node.type === "SOURCE" ? 4.6 : 2.1;
+        const isFocus = node.id === focus ? 1.0 : 0.0;
+        const isNeighbor = neighbors.has(node.id) ? 1.0 : 0.0;
+
+        nodeParamsData[i * 4] = baseR;
+        nodeParamsData[i * 4 + 1] = isCore ? 1.0 : 0.0;
+        nodeParamsData[i * 4 + 2] = isFocus;
+        nodeParamsData[i * 4 + 3] = isNeighbor;
+      }
+
+      gl!.bindBuffer(gl!.ARRAY_BUFFER, nodeParamsBuffer);
+      gl!.bufferData(gl!.ARRAY_BUFFER, nodeParamsData, gl!.DYNAMIC_DRAW);
+
+      const edgeParamData = new Float32Array(validEdges.length * 4);
+      for (let i = 0; i < validEdges.length; i++) {
+        const edge = validEdges[i]!;
+        const isDerived = edge.type === "DERIVED_FROM" ? 1.0 : 0.0;
+        const isIncident = edge.source === focus || edge.target === focus ? 1.0 : 0.0;
+
+        edgeParamData[i * 4] = isDerived;
+        edgeParamData[i * 4 + 1] = isIncident;
+        edgeParamData[i * 4 + 2] = isDerived;
+        edgeParamData[i * 4 + 3] = isIncident;
+      }
+
+      gl!.bindBuffer(gl!.ARRAY_BUFFER, edgeParamBuffer);
+      gl!.bufferData(gl!.ARRAY_BUFFER, edgeParamData, gl!.DYNAMIC_DRAW);
+
+      lastFocus = focus;
+      focusDirty = false;
+    };
 
     const render = () => {
       frame = 0;
       if (!gl || gl.isContextLost()) return;
 
       const { nodes, edges, positions, coordinates, showTitles, selectedNodeId } = current.current;
+      const focus = hover ?? selectedNodeId;
+
+      if (nodes !== lastNodes || edges !== lastEdges || coordinates !== lastCoordinates || positions !== lastPositions) {
+        updateDataBuffers();
+      }
+
+      if (focus !== lastFocus || focusDirty) {
+        updateFocusBuffers(focus);
+      }
+
       const extent = Math.max(60, ...[...coordinates.values()].map(p => Math.hypot(p.x, p.y, p.z)));
       const scale = (Math.min(width, height) * 0.4) / extent;
       const camera = cameraRef.current;
-      const focus = hover ?? selectedNodeId;
 
-      const neighbors = new Set<string>();
-      if (focus) {
-        for (let i = 0; i < edges.length; i++) {
-          const edge = edges[i]!;
-          if (edge.source === focus) neighbors.add(edge.target);
-          if (edge.target === focus) neighbors.add(edge.source);
-        }
-      }
-
-      // 1. Prepare Node Buffers
-      const validNodes: MemoryGraphNode[] = [];
-      const nodePosArray: number[] = [];
-      const nodeColorArray: number[] = [];
-      const nodeParamsArray: number[] = [];
-      const pickParamsArray: number[] = [];
-      const projectedForHit: Array<{ id: string; x: number; y: number; z: number; radius: number }> = [];
-
-      for (let i = 0; i < nodes.length; i++) {
-        const node = nodes[i]!;
-        const coord = coordinates.get(node.id);
-        if (!coord) continue;
-
-        validNodes.push(node);
-        nodePosArray.push(coord.x, coord.y, coord.z);
-
-        const col = parseHexColor(positions.get(node.id)?.color);
-        nodeColorArray.push(col[0], col[1], col[2], col[3]);
-
-        const isCore = node.type === "SOURCE" && isMemoryCoreLabel(node.label);
-        const baseR = isCore ? 10.0 : node.type === "SOURCE" ? 4.6 : 2.1;
-        const isFocus = node.id === focus ? 1.0 : 0.0;
-        const isNeighbor = neighbors.has(node.id) ? 1.0 : 0.0;
-
-        nodeParamsArray.push(baseR, isCore ? 1.0 : 0.0, isFocus, isNeighbor);
-        pickParamsArray.push(baseR, validNodes.length); // 1-based index
-
-        const p = projectMemoryPoint(coord, camera, scale, width, height);
-        const radius = Math.max(1, baseR * p.perspective * Math.sqrt(camera.zoom)) * (isFocus > 0.5 ? 1.5 : 1);
-        projectedForHit.push({ id: node.id, x: p.x, y: p.y, z: p.z, radius });
-      }
-
-      spatialIndex = new SpatialPickingIndex(projectedForHit);
-      cachedNodeCount = validNodes.length;
-
-      // 2. Prepare Edge Buffers
-      const edgePosArray: number[] = [];
-      const edgeParamArray: number[] = [];
-
-      for (let i = 0; i < edges.length; i++) {
-        const edge = edges[i]!;
-        const c1 = coordinates.get(edge.source);
-        const c2 = coordinates.get(edge.target);
-        if (!c1 || !c2) continue;
-
-        edgePosArray.push(c1.x, c1.y, c1.z, c2.x, c2.y, c2.z);
-        const isDerived = edge.type === "DERIVED_FROM" ? 1.0 : 0.0;
-        const isIncident = edge.source === focus || edge.target === focus ? 1.0 : 0.0;
-        edgeParamArray.push(isDerived, isIncident, isDerived, isIncident);
-      }
-      cachedEdgeVertexCount = edgePosArray.length / 3;
-
-      // Upload Buffers
-      gl.bindBuffer(gl.ARRAY_BUFFER, nodePosBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(nodePosArray), gl.DYNAMIC_DRAW);
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, nodeColorBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(nodeColorArray), gl.DYNAMIC_DRAW);
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, nodeParamsBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(nodeParamsArray), gl.DYNAMIC_DRAW);
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, edgePosBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(edgePosArray), gl.DYNAMIC_DRAW);
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, edgeParamBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(edgeParamArray), gl.DYNAMIC_DRAW);
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, pickParamsBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pickParamsArray), gl.DYNAMIC_DRAW);
-
-      // Render WebGL
       gl.viewport(0, 0, Math.round(width * dpr), Math.round(height * dpr));
       gl.clearColor(0, 0, 0, 0);
       gl.clearDepth(1.0);
@@ -602,7 +588,7 @@ export function MemoryGraph3D({
       const hasFocusVal = focus ? 1.0 : 0.0;
 
       // Draw Edges
-      if (cachedEdgeVertexCount > 0 && edgeProgram) {
+      if (cachedEdgeVertexCount > 0 && edgeProgram && edgeVao) {
         gl.useProgram(edgeProgram);
         gl.uniform1f(gl.getUniformLocation(edgeProgram, "uYaw"), camera.yaw);
         gl.uniform1f(gl.getUniformLocation(edgeProgram, "uPitch"), camera.pitch);
@@ -612,17 +598,9 @@ export function MemoryGraph3D({
         gl.uniform1f(gl.getUniformLocation(edgeProgram, "uExtent"), extent);
         gl.uniform1f(gl.getUniformLocation(edgeProgram, "uHasFocus"), hasFocusVal);
 
-        gl.bindBuffer(gl.ARRAY_BUFFER, edgePosBuffer);
-        gl.enableVertexAttribArray(0);
-        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-
-        gl.bindBuffer(gl.ARRAY_BUFFER, edgeParamBuffer);
-        gl.enableVertexAttribArray(1);
-        gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 0, 0);
-
+        gl.bindVertexArray(edgeVao);
         gl.drawArrays(gl.LINES, 0, cachedEdgeVertexCount);
-        gl.disableVertexAttribArray(0);
-        gl.disableVertexAttribArray(1);
+        gl.bindVertexArray(null);
       }
 
       // Draw Instanced Nodes
@@ -637,30 +615,7 @@ export function MemoryGraph3D({
         gl.uniform1f(gl.getUniformLocation(nodeProgram, "uHasFocus"), hasFocusVal);
 
         gl.bindVertexArray(quadVao);
-
-        gl.bindBuffer(gl.ARRAY_BUFFER, nodePosBuffer);
-        gl.enableVertexAttribArray(1);
-        gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
-        gl.vertexAttribDivisor(1, 1);
-
-        gl.bindBuffer(gl.ARRAY_BUFFER, nodeColorBuffer);
-        gl.enableVertexAttribArray(2);
-        gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 0, 0);
-        gl.vertexAttribDivisor(2, 1);
-
-        gl.bindBuffer(gl.ARRAY_BUFFER, nodeParamsBuffer);
-        gl.enableVertexAttribArray(3);
-        gl.vertexAttribPointer(3, 4, gl.FLOAT, false, 0, 0);
-        gl.vertexAttribDivisor(3, 1);
-
         gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, cachedNodeCount);
-
-        gl.vertexAttribDivisor(1, 0);
-        gl.vertexAttribDivisor(2, 0);
-        gl.vertexAttribDivisor(3, 0);
-        gl.disableVertexAttribArray(1);
-        gl.disableVertexAttribArray(2);
-        gl.disableVertexAttribArray(3);
         gl.bindVertexArray(null);
       }
 
@@ -668,6 +623,14 @@ export function MemoryGraph3D({
       labelCtx.clearRect(0, 0, width, height);
       if (showTitles) {
         labelCtx.font = "11px system-ui, sans-serif";
+        const neighbors = new Set<string>();
+        if (focus) {
+          for (let i = 0; i < validEdges.length; i++) {
+            const edge = validEdges[i]!;
+            if (edge.source === focus) neighbors.add(edge.target);
+            if (edge.target === focus) neighbors.add(edge.source);
+          }
+        }
         const labelsToDraw = selectVisibleLabels({
           nodes: validNodes,
           coordinates,
@@ -713,71 +676,53 @@ export function MemoryGraph3D({
       schedule();
     };
 
-    // Picking: GPU Scissor picking with fallback to fast O(1) SpatialPickingIndex (<0.1ms)
+    const ensureSpatialIndex = () => {
+      const camera = cameraRef.current;
+      const { coordinates } = current.current;
+      const extent = Math.max(60, ...[...coordinates.values()].map(p => Math.hypot(p.x, p.y, p.z)));
+      const scale = (Math.min(width, height) * 0.4) / extent;
+
+      if (
+        spatialIndex &&
+        lastPickYaw === camera.yaw &&
+        lastPickPitch === camera.pitch &&
+        lastPickZoom === camera.zoom &&
+        lastPickScale === scale &&
+        lastPickWidth === width &&
+        lastPickHeight === height
+      ) {
+        return;
+      }
+
+      const focus = hover ?? current.current.selectedNodeId;
+      const projectedForHit: Array<{ id: string; x: number; y: number; z: number; radius: number }> = [];
+
+      for (let i = 0; i < validNodes.length; i++) {
+        const node = validNodes[i]!;
+        const coord = coordinates.get(node.id);
+        if (!coord) continue;
+
+        const isCore = node.type === "SOURCE" && isMemoryCoreLabel(node.label);
+        const baseR = isCore ? 10.0 : node.type === "SOURCE" ? 4.6 : 2.1;
+        const isFocus = node.id === focus;
+
+        const p = projectMemoryPoint(coord, camera, scale, width, height);
+        const radius = Math.max(1, baseR * p.perspective * Math.sqrt(camera.zoom)) * (isFocus ? 1.5 : 1);
+        projectedForHit.push({ id: node.id, x: p.x, y: p.y, z: p.z, radius });
+      }
+
+      spatialIndex = new SpatialPickingIndex(projectedForHit);
+      lastPickYaw = camera.yaw;
+      lastPickPitch = camera.pitch;
+      lastPickZoom = camera.zoom;
+      lastPickScale = scale;
+      lastPickWidth = width;
+      lastPickHeight = height;
+    };
+
     const pickNode = (screenX: number, screenY: number): string | null => {
-      if (spatialIndex) {
-        const id = spatialIndex.findHit(screenX, screenY);
-        if (id) return id;
-      }
-
-      if (gl && !gl.isContextLost() && pickProgram && pickFbo && quadVao && cachedNodeCount > 0) {
-        try {
-          const { coordinates } = current.current;
-          const extent = Math.max(60, ...[...coordinates.values()].map(p => Math.hypot(p.x, p.y, p.z)));
-          const scale = (Math.min(width, height) * 0.4) / extent;
-          const camera = cameraRef.current;
-
-          gl.bindFramebuffer(gl.FRAMEBUFFER, pickFbo);
-          gl.viewport(0, 0, Math.round(width), Math.round(height));
-          gl.enable(gl.SCISSOR_TEST);
-          gl.scissor(Math.round(screenX), Math.round(height - screenY), 1, 1);
-          gl.clearColor(0, 0, 0, 0);
-          gl.clearDepth(1.0);
-          gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-
-          gl.useProgram(pickProgram);
-          gl.uniform1f(gl.getUniformLocation(pickProgram, "uYaw"), camera.yaw);
-          gl.uniform1f(gl.getUniformLocation(pickProgram, "uPitch"), camera.pitch);
-          gl.uniform1f(gl.getUniformLocation(pickProgram, "uZoom"), camera.zoom);
-          gl.uniform1f(gl.getUniformLocation(pickProgram, "uScale"), scale);
-          gl.uniform2f(gl.getUniformLocation(pickProgram, "uViewport"), width, height);
-          gl.uniform1f(gl.getUniformLocation(pickProgram, "uExtent"), extent);
-
-          gl.bindVertexArray(quadVao);
-
-          gl.bindBuffer(gl.ARRAY_BUFFER, nodePosBuffer);
-          gl.enableVertexAttribArray(1);
-          gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
-          gl.vertexAttribDivisor(1, 1);
-
-          gl.bindBuffer(gl.ARRAY_BUFFER, pickParamsBuffer);
-          gl.enableVertexAttribArray(2);
-          gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 0, 0);
-          gl.vertexAttribDivisor(2, 1);
-
-          gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, cachedNodeCount);
-
-          gl.vertexAttribDivisor(1, 0);
-          gl.vertexAttribDivisor(2, 0);
-          gl.disableVertexAttribArray(1);
-          gl.disableVertexAttribArray(2);
-          gl.bindVertexArray(null);
-
-          const pixel = new Uint8Array(4);
-          gl.readPixels(Math.round(screenX), Math.round(height - screenY), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
-          gl.disable(gl.SCISSOR_TEST);
-          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-
-          const index = pixel[0]! | (pixel[1]! << 8) | (pixel[2]! << 16);
-          if (index > 0 && index <= current.current.nodes.length) {
-            return current.current.nodes[index - 1]?.id ?? null;
-          }
-        } catch {
-          // ignore GPU picking errors and fall back to spatial index
-        }
-      }
-
-      return null;
+      ensureSpatialIndex();
+      return spatialIndex?.findHit(screenX, screenY) ?? null;
     };
 
     const local = (event: PointerEvent) => {
@@ -899,14 +844,10 @@ export function MemoryGraph3D({
         if (nodeParamsBuffer) gl.deleteBuffer(nodeParamsBuffer);
         if (edgePosBuffer) gl.deleteBuffer(edgePosBuffer);
         if (edgeParamBuffer) gl.deleteBuffer(edgeParamBuffer);
-        if (pickParamsBuffer) gl.deleteBuffer(pickParamsBuffer);
-        if (pickColorRb) gl.deleteRenderbuffer(pickColorRb);
-        if (pickDepthRb) gl.deleteRenderbuffer(pickDepthRb);
-        if (pickFbo) gl.deleteFramebuffer(pickFbo);
         if (quadVao) gl.deleteVertexArray(quadVao);
+        if (edgeVao) gl.deleteVertexArray(edgeVao);
         if (nodeProgram) gl.deleteProgram(nodeProgram);
         if (edgeProgram) gl.deleteProgram(edgeProgram);
-        if (pickProgram) gl.deleteProgram(pickProgram);
       }
     };
   }, [useFallback]);
