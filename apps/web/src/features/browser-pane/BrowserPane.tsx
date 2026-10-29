@@ -1,9 +1,11 @@
+import { browserReconnectDelayMs } from "./browser-reconnect.js";
 import { usePanePolling } from "../../use-pane-polling.js";
 import { useGoogleAccountSignIn } from "./useGoogleAccountSignIn.js";
 import { useBrowserAudio } from "./useBrowserAudio.js";
 import { resolveBrowserAddress } from "./browser-address.js";
-import { effectiveAccountId, googleSignInTarget as accountSignInTarget, privatePaneProfileId, type YouTubeAccounts as GoogleAccounts } from "./youtube-accounts.js";
-import { GoogleAccountMenuItems, selectedAccountSummary } from "./GoogleAccountMenuItems.js";
+import { roomPaneLimit } from "../../pane-runtime-availability.js";
+import { accountEntryForProfile, accountNeedsSignIn, effectiveAccountId, googleSignInTarget as accountSignInTarget, privatePaneProfileId, type YouTubeAccounts as GoogleAccounts } from "./youtube-accounts.js";
+import { avatarHue, GoogleAccountMenuItems, selectedAccountSummary } from "./GoogleAccountMenuItems.js";
 import {
   Bookmark,
   BookmarkPlus,
@@ -11,8 +13,8 @@ import {
   Camera,
   ChevronLeft,
   ChevronRight,
+  Clipboard,
   CircleStop,
-  Download,
   Globe2,
   Keyboard,
   Loader2,
@@ -34,7 +36,6 @@ import {
   Square,
   Tablet,
   Trash2,
-  Upload,
   UserCheck,
   Users,
   Video,
@@ -45,13 +46,12 @@ import {
   useMemo,
   useRef,
   useState,
-  type ChangeEvent,
+  type CSSProperties,
   type FormEvent
 } from "react";
 import {
   browserStreamWebSocketServerMessageSchema,
   type Artifact,
-  type BrowserBookmark,
   type BrowserFrame,
   type BrowserSessionViewport,
   type Pane,
@@ -80,14 +80,21 @@ import {
   type UiTheme
 } from "../../ui-theme.js";
 import { BrowserCanvas, type BrowserCanvasHandle, type BrowserCanvasInput } from "./BrowserCanvas.js";
+import { useBrowserSelectOverlay } from "./BrowserSelectOverlay.js";
 import { useAutoDismiss } from "../../use-auto-dismiss.js";
 import {
+  BROWSER_CONTROL_IDLE_RELEASE_MS,
   BROWSER_PANE_ACCOUNT_SELECTED_EVENT,
   BROWSER_PANE_ACTION_EVENT,
+  MARKETING_BOOKMARKS_CHANGED_EVENT,
   parseBrowserPaneActionDetail,
+  publishBrowserPaneControl,
   registerBrowserPaneEventTarget
 } from "./events.js";
 import { BrowserLiveStatus } from "./BrowserLiveStatus.js";
+import { BookmarksTab } from "../marketing-copilot-pane/BookmarksTab.js";
+import { relativeTime } from "../job-apply-pane/QueueTab.js";
+import { requestNousFocus } from "../nous-focus/nous-focus-events.js";
 
 // shortcut: below this measured toolbar width the compact Live badge (state + fps, ~97px) would squeeze the address
 // field under the 160px the browser proofs require at 320px; upgrade to a two-row toolbar if phones need the badge.
@@ -140,6 +147,8 @@ const streamModeOptions: Array<{ id: BrowserStreamMode; label: string }> = [
 ];
 
 const emptyDiagnostics: BrowserDiagnosticsPayload = { sessionId: "browser:pending", events: [] };
+/** A tab moved to a new pane in another Google account; that pane opens it there when it mounts. */
+const accountTabMoves = new Map<string, { profileId: string; url: string | null }>();
 
 function metadataText(metadata: Record<string, unknown>, key: string, fallback = "-"): string {
   const value = metadata[key];
@@ -186,6 +195,24 @@ function isBrowserFrameMessage(value: unknown): value is BrowserFrameMessage {
   return typeof value === "object" && value !== null && "type" in value;
 }
 
+/** HTTP fallback queue: a move replaces the waiting move of the same kind, wheel deltas add up within the contract's limit. */
+export function queueBrowserHttpInput(queue: BrowserInputPayload[], input: BrowserInputPayload): void {
+  const last = queue.at(-1);
+  const sameKind = last && last.type === input.type && "eventType" in last && "eventType" in input
+    && last.eventType === input.eventType && last.leaseId === input.leaseId && last.modifiers === input.modifiers;
+  if (sameKind && input.type === "TOUCH" && input.eventType === "touchMove") { queue[queue.length - 1] = input; return; }
+  if (sameKind && last.type === "POINTER" && input.type === "POINTER") {
+    if (input.eventType === "mouseMoved") { queue[queue.length - 1] = input; return; }
+    const deltaX = (last.deltaX ?? 0) + (input.deltaX ?? 0);
+    const deltaY = (last.deltaY ?? 0) + (input.deltaY ?? 0);
+    if (input.eventType === "mouseWheel" && Math.abs(deltaX) <= 10000 && Math.abs(deltaY) <= 10000) {
+      queue[queue.length - 1] = { ...input, deltaX, deltaY };
+      return;
+    }
+  }
+  queue.push(input);
+}
+
 function scrollPaneIntoView(element: HTMLElement | null) {
   if (typeof element?.scrollIntoView !== "function") return;
   element.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -195,20 +222,33 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
   const [status, setStatus] = useState<BrowserStatusPayload | null>(null);
   const [response, setResponse] = useState<PaneBrowserSessionResponse | null>(null);
   const [frame, setFrame] = useState<BrowserFrame | null>(null);
+  const browserSelect = useBrowserSelectOverlay({ paneId: pane.id, sendInput: (input) => void sendCanvasInput(input), onFrame: (next) => appendFrame(next) });
   const [url, setUrl] = useState("");
   const [handoff, setHandoff] = useState(false);
+  const [browserAgent, setBrowserAgent] = useState<BrowserPageListPayload["agent"]>(null);
   const [googleAccounts, setGoogleAccounts] = useState<GoogleAccounts | null>(null);
   const [googleAccountMenuOpen, setGoogleAccountMenuOpen] = useState(false);
-  const googleAccountSummary = googleAccounts ? selectedAccountSummary(googleAccounts) : null;
   const googleAccountPickerRef = useRef<HTMLDivElement | null>(null);
   const googleAccountButtonRef = useRef<HTMLButtonElement | null>(null);
   const [googleSignInTarget, setGoogleSignInTarget] = useState<string | null>(null);
+  const [tabMenu, setTabMenu] = useState<{ page: BrowserPageSummaryPayload; x: number; y: number } | null>(null);
+  const tabMenuRef = useRef<HTMLDivElement | null>(null);
   const [controlLease, setControlLease] = useState<BrowserControlLeasePayload | null>(null);
   const [streamMode, setStreamMode] = useState<BrowserStreamMode>("AUTO");
   const [blankTabRequested, setBlankTabRequested] = useState(false);
   const [pages, setPages] = useState<BrowserPageSummaryPayload[]>([]);
   const emptyBrowser = !blankTabRequested && pages.length === 1 && pages[0]?.url === "about:blank";
   const [activePageId, setActivePageId] = useState<string | null>(null);
+  const activeTab = pages.find((page) => activePageId ? page.pageId === activePageId : page.isActive);
+  // A Browser Host with per-tab accounts reports `account` on every tab (null: the pane's account).
+  const tabAccounts = pane.mode !== "FREELANCE_COPILOT" && pages.length > 0 && pages.every((page) => page.account !== undefined);
+  // The menu shows (and changes) the account of the tab in view once the pane has more than one tab or that tab has its own.
+  const tabScoped = tabAccounts && Boolean(activeTab) && (pages.length > 1 || Boolean(activeTab?.account));
+  const menuAccounts = googleAccounts && activeTab?.account
+    ? { ...googleAccounts, selectedProfileId: activeTab.account.profileId, effectiveProfileId: activeTab.account.profileId } : googleAccounts;
+  const googleAccountSummary = menuAccounts ? selectedAccountSummary(menuAccounts) : null;
+  const tabAccountLabel = (account: NonNullable<BrowserPageSummaryPayload["account"]>) =>
+    account.label ?? (googleAccounts ? accountEntryForProfile(googleAccounts, account.profileId)?.title : undefined) ?? "Other account";
   const pageListRef = useRef<BrowserPageListPayload | null>(null);
   const pageSessionIdRef = useRef<string | null>(null);
   const pageRequestRef = useRef(0);
@@ -252,11 +292,7 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
   const streamedViewportRef = useRef<{ width: number; height: number } | undefined>(undefined);
   const [textInput, setTextInput] = useState("");
   const [textInputOpen, setTextInputOpen] = useState(false);
-  const [bookmarks, setBookmarks] = useState<BrowserBookmark[]>([]);
   const [bookmarksOpen, setBookmarksOpen] = useState(false);
-  const [bookmarksLoaded, setBookmarksLoaded] = useState(false);
-  const [bookmarksPending, setBookmarksPending] = useState(false);
-  const [bookmarkNotice, setBookmarkNotice] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   useAutoDismiss(error, setError);
@@ -265,11 +301,18 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
   const paneRef = useRef<HTMLElement | null>(null);
   const urlDraftRef = useRef<string | null>(null);
   const browserToolbarRef = useRef<HTMLDivElement | null>(null);
-  const bookmarkImportRef = useRef<HTMLInputElement | null>(null);
   const handoffInputRef = useRef<HTMLInputElement | null>(null);
   const persistedRecordingVideoRef = useRef<HTMLVideoElement | null>(null);
   const controlLeaseRef = useRef<BrowserControlLeasePayload | null>(null);
   const latestControlLeaseRef = useRef<BrowserControlLeasePayload | null>(null);
+  const lastOperatorInputAtRef = useRef(Date.now());
+  // Operator 2026-10-27: during a sign-in, code or CAPTCHA handoff (the server says so), being on the pane is not idle: the tab
+  // shown, the pane in view and focused or maximized; idle counts once they leave it.
+  const presenceHoldRef = useRef(false);
+  const onPaneRef = useRef<() => boolean>(() => false);
+  onPaneRef.current = () => document.visibilityState === "visible" && isVisible && !pane.isMinimized
+    && (pane.isMaximized || Boolean(paneRef.current?.contains(document.activeElement)));
+  const releaseControlRef = useRef<() => Promise<void>>(async () => undefined);
   const controlAcquirePromiseRef = useRef<Promise<BrowserControlLeasePayload | null> | null>(null);
   const legacyControlRef = useRef(false);
   const legacyPointerDownRef = useRef<{ x: number; y: number; button: string } | null>(null);
@@ -279,6 +322,7 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
   const pendingBrowserInputAcksRef = useRef(new Map<string, PendingBrowserInputAck>());
   const coalescedBrowserInputRef = useRef<BrowserInputPayload | null>(null);
   const coalescedBrowserInputFrameRef = useRef<number | null>(null);
+  const httpBrowserInputRef = useRef<{ busy: boolean; queue: BrowserInputPayload[] }>({ busy: false, queue: [] });
 
   useEffect(() => {
     const paneElement = paneRef.current;
@@ -543,7 +587,11 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
     if (pending?.sessionId === sessionId && pending.request === pageRequestRef.current) return pending.promise;
     const request = ++pageRequestRef.current;
     const promise = api.browserPages(pane.id).then((next) => {
-      if (request !== pageRequestRef.current || sessionId !== pageSessionIdRef.current || next.sessionId !== sessionId) return null;
+      if (request !== pageRequestRef.current || sessionId !== pageSessionIdRef.current) return null;
+      if (next.sessionId !== sessionId) {
+        if (sessionId) void followServerSession(sessionId);
+        return null;
+      }
       applyPagePayload(next);
       return next;
     }).catch(() => null).finally(() => {
@@ -556,6 +604,17 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
   usePanePolling(async () => {
     if (!pageMutationRef.current) await loadPages();
   }, 5000, isVisible && !pane.isMinimized && Boolean(session && session.status !== "CLOSED"), false);
+
+  // An agent can replace this browser (another Google account) or start it again after it closed: the view follows the
+  // server's session instead of keeping the old one's "No open tabs" (2026-10-22). Reads only; never starts Chrome.
+  async function followServerSession(heldSessionId: string) {
+    const next = await api.browserSession(pane.id).catch(() => null);
+    if (next && next.session.sessionId !== heldSessionId && pageSessionIdRef.current === heldSessionId) applyResponse(next);
+  }
+
+  usePanePolling(async () => {
+    if (pageSessionIdRef.current) await followServerSession(pageSessionIdRef.current);
+  }, 5000, isVisible && !pane.isMinimized && session?.status === "CLOSED", false);
 
   async function loadArtifacts() {
     setArtifactsPending(true);
@@ -573,14 +632,65 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
   // A selection made meanwhile wins over an older answer.
   const googleAccountsRequestRef = useRef(0);
   function loadGoogleAccounts() {
-    if (observerOnly || (pane.mode !== "BROWSER" && pane.mode !== "JOB_APPLY" && pane.mode !== "MARKETING_COPILOT") || typeof api.browserAccounts !== "function") return () => undefined;
+    if (observerOnly || (pane.mode !== "BROWSER" && pane.mode !== "JOB_APPLY" && pane.mode !== "MARKETING_COPILOT" && pane.mode !== "FREELANCE_COPILOT") || typeof api.browserAccounts !== "function") return () => undefined;
     const request = ++googleAccountsRequestRef.current;
     api.browserAccounts(pane.id).then((accounts) => { if (googleAccountsRequestRef.current === request) setGoogleAccounts(accounts); }).catch(() => undefined);
     return () => { if (googleAccountsRequestRef.current === request) googleAccountsRequestRef.current += 1; };
   }
   useEffect(() => loadGoogleAccounts(), [pane.id, pane.mode, observerOnly]);
 
-  async function selectGoogleAccount(profileId: string | null, reconnect = false) {
+  // Another account for the tab in view: it changes account in place and the other tabs keep the pane's
+  // (operator request 2026-10-15). A Browser Host from before per-tab accounts moves it to a new Browser pane
+  // next to this one instead. Freelance Copilot tabs stay: they must leave through the platform's egress route.
+  async function chooseGoogleAccount(profileId: string) {
+    if (tabScoped && googleAccounts && activeTab && session && session.status !== "CLOSED") {
+      const paneAccount = effectiveAccountId(googleAccounts);
+      if (profileId === (activeTab.account?.profileId ?? paneAccount)) return setGoogleAccountMenuOpen(false);
+      const status = googleAccounts.profiles.find((profile) => profile.profileId === profileId)?.browserStatus;
+      return switchTabAccount(activeTab.pageId, profileId === paneAccount ? null : profileId, accountNeedsSignIn(status));
+    }
+    const activePage = activeTab;
+    if (pane.mode === "FREELANCE_COPILOT" || !googleAccounts || profileId === effectiveAccountId(googleAccounts) || emptyBrowser || pages.length < 2
+      || !activePage || activePage.pageId.startsWith("legacy:") || !session || session.status === "CLOSED") return selectGoogleAccount(profileId);
+    if (pending || observerOnly || pageMutationRef.current) return;
+    setGoogleAccountMenuOpen(false);
+    pageMutationRef.current = true;
+    pageRequestRef.current += 1;
+    setPending(true);
+    setError(null);
+    try {
+      // shortcut: checks the 16-pane maximum, not a lower room paneCap; read the room when lower caps are used.
+      if ((await api.panes(pane.roomId)).data.length >= roomPaneLimit(null)) throw new Error(`This room already has the maximum of ${roomPaneLimit(null)} panes.`);
+      const title = `Browser · ${accountEntryForProfile(googleAccounts, profileId)?.title ?? "account"}`.slice(0, 120);
+      const created = await api.createPane(pane.roomId, title, "BROWSER", { split: { parentId: pane.id, direction: "horizontal", size: 50 } });
+      accountTabMoves.set(created.id, { profileId, url: activePage.url && activePage.url !== "about:blank" ? activePage.url : null });
+      applyPagePayload(await api.closeBrowserPage(pane.id, activePage.pageId));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "The tab could not move to a new pane.");
+    } finally {
+      pageMutationRef.current = false;
+      setPending(false);
+    }
+  }
+
+  async function switchTabAccount(pageId: string, profileId: string | null, signIn: boolean) {
+    if (pending || observerOnly || pageMutationRef.current) return;
+    setGoogleAccountMenuOpen(false);
+    pageMutationRef.current = true;
+    pageRequestRef.current += 1;
+    setPending(true);
+    setError(null);
+    try {
+      applyPagePayload(await api.setBrowserPageAccount(pane.id, pageId, profileId, signIn ? { signIn: true } : {}));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "The tab could not change its Google account.");
+    } finally {
+      pageMutationRef.current = false;
+      setPending(false);
+    }
+  }
+
+  async function selectGoogleAccount(profileId: string | null, reconnect = false, openUrl: string | null = null) {
     if (pending || observerOnly) return;
     setGoogleAccountMenuOpen(false);
     googleAccountsRequestRef.current += 1;
@@ -600,7 +710,8 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
       setPages([]);
       setActivePageId(null);
       urlDraftRef.current = null;
-      const targetUrl = reconnect ? accountSignInTarget(selected.targetUrl, `https://accounts.google.com/ServiceLogin?continue=${encodeURIComponent("https://www.google.com/")}`) : selected.targetUrl;
+      const targetUrl = reconnect ? accountSignInTarget(selected.targetUrl, `https://accounts.google.com/ServiceLogin?continue=${encodeURIComponent("https://www.google.com/")}`)
+        : openUrl ? accountSignInTarget(selected.targetUrl, openUrl) : selected.targetUrl;
       setUrl(targetUrl);
       setGoogleAccounts((current) => current ? { ...current, selectedProfileId: selected.selectedProfileId, effectiveProfileId: selected.selectedProfileId } : current);
       setGoogleSignInTarget(profileId ? targetUrl : null);
@@ -681,7 +792,10 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
   }
 
   useEffect(() => {
-    void loadOrStart();
+    const move = accountTabMoves.get(pane.id);
+    accountTabMoves.delete(pane.id);
+    if (move) void selectGoogleAccount(move.profileId, false, move.url).then(() => { loadGoogleAccounts(); return loadOrStart(false); });
+    else void loadOrStart();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pane.id]);
 
@@ -695,10 +809,19 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mobile, observerOnly, isVisible, pane.id, session?.sessionId, session?.viewport, session?.status]);
 
+  // A hidden page (phone screen off, app in the background) needs no frames: the stream reconnects when it shows again.
+  const [pageHidden, setPageHidden] = useState(() => typeof document !== "undefined" && document.visibilityState === "hidden");
+  useEffect(() => {
+    const update = () => setPageHidden(document.visibilityState === "hidden");
+    document.addEventListener("visibilitychange", update);
+    return () => document.removeEventListener("visibilitychange", update);
+  }, []);
+  const streamPausedWhileHidden = pageHidden && !observerOnly;
+
   useEffect(() => {
     const fallbackTicket = response?.websocket ?? null;
     const sessionId = session?.sessionId ?? null;
-    if (!fallbackTicket || !sessionId || session?.status === "CLOSED" || streamMode === "SILENT") {
+    if (!fallbackTicket || !sessionId || session?.status === "CLOSED" || streamMode === "SILENT" || streamPausedWhileHidden) {
       updateBrowserStreamTelemetry(streamMode === "SILENT" ? "silent" : "idle");
       return;
     }
@@ -712,7 +835,7 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
 
     const scheduleReconnect = () => {
       if (disposed || reconnectTimer !== null) return;
-      const delayMs = Math.min(2_000, 250 * (2 ** Math.min(reconnectAttempt, 3)));
+      const delayMs = browserReconnectDelayMs(reconnectAttempt, 250);
       reconnectAttempt += 1;
       updateBrowserStreamTelemetry("reconnecting");
       setError((current) => current ?? browserStreamReconnectMessage);
@@ -852,12 +975,15 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
     };
     // Browser input refs intentionally keep high-frequency ACKs outside React state.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pane.id, response?.websocket?.token, session?.sessionId, session?.status, streamMode]);
+  }, [pane.id, response?.websocket?.token, session?.sessionId, session?.status, streamMode, streamPausedWhileHidden]);
 
   useEffect(() => {
     controlLeaseRef.current = controlLease?.status === "ACTIVE" ? controlLease : null;
     latestControlLeaseRef.current = controlLease;
-  }, [controlLease]);
+    publishBrowserPaneControl(pane.id, controlLease?.status === "ACTIVE");
+  }, [controlLease, pane.id]);
+
+  useEffect(() => () => publishBrowserPaneControl(pane.id, false), [pane.id]);
 
   useEffect(() => {
     if (!debugOpen || debugTab !== "timeline") return;
@@ -886,8 +1012,16 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
         setHandoff(false);
         return;
       }
-      api.heartbeatBrowserControl(pane.id, { leaseId: lease.leaseId, ttlSeconds: 60 })
+      const present = onPaneRef.current();
+      if (presenceHoldRef.current && present) lastOperatorInputAtRef.current = Date.now();
+      // Holding the browser without using it (a handoff that ended unnoticed) would keep the agent locked out.
+      if (lease.status === "ACTIVE" && Date.now() - lastOperatorInputAtRef.current >= BROWSER_CONTROL_IDLE_RELEASE_MS) {
+        void releaseControlRef.current();
+        return;
+      }
+      api.heartbeatBrowserControl(pane.id, { leaseId: lease.leaseId, ttlSeconds: 60, present })
         .then((next) => {
+          presenceHoldRef.current = Boolean(next.presenceHold);
           if (next.lease.status === "ACTIVE") {
             setControlLease(next.lease);
           } else {
@@ -1067,6 +1201,7 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
     if (next.sessionId !== pageSessionIdRef.current) return;
     pageRequestRef.current += 1;
     pageListRef.current = next;
+    setBrowserAgent(next.agent ?? null);
     setPages(next.pages);
     setActivePageId(next.activePageId);
     const active = next.pages.find((page) => page.pageId === next.activePageId);
@@ -1387,59 +1522,25 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
     }
   }
 
-  async function loadBookmarks() {
-    if (!session) {
-      setError("Start a browser session before using bookmarks.");
-      return;
-    }
-    setBookmarksPending(true);
-    setError(null);
-    setBookmarkNotice(null);
-    try {
-      const next = await api.browserBookmarks(pane.id);
-      setBookmarks(next.bookmarks);
-      setBookmarksLoaded(true);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Browser bookmarks failed to load");
-    } finally {
-      setBookmarksPending(false);
-    }
-  }
-
-  async function toggleBookmarks() {
-    const nextOpen = !bookmarksOpen;
-    setBookmarksOpen(nextOpen);
-    if (nextOpen && (!bookmarksLoaded || session)) {
-      await loadBookmarks();
-    }
-  }
-
-  async function openBookmarks() {
+  function openBookmarks() {
     if (!session) {
       setError("Start a browser session before using bookmarks.");
       return;
     }
     scrollPaneIntoView(paneRef.current);
     setBookmarksOpen(true);
-    if (!bookmarksLoaded) await loadBookmarks();
   }
 
-  async function openBookmarkImport() {
-    if (!session) {
-      setError("Start a browser session before importing bookmarks.");
-      return;
-    }
-    scrollPaneIntoView(paneRef.current);
-    setBookmarksOpen(true);
-    if (!bookmarksLoaded) await loadBookmarks();
-    bookmarkImportRef.current?.click();
-  }
-
-  async function acquireControlForInput(): Promise<BrowserControlLeasePayload | null> {
+  /** `renew` asks the server even while a lease is held: an explicit join (the control icon, a copilot's
+   * "Take control") must reach it, so a handoff the agent requested meanwhile is accepted. */
+  async function acquireControlForInput(renew = false, interaction = true): Promise<BrowserControlLeasePayload | null> {
     if (!session || session.status === "CLOSED" || observerOnly) return null;
+    // A hover is forwarded but is not an interaction: it does not keep the browser from the agent.
+    if (interaction) lastOperatorInputAtRef.current = Date.now();
     const currentLease = controlLeaseRef.current;
-    if (currentLease?.status === "ACTIVE" && currentLease.sessionId === session.sessionId && Date.parse(currentLease.expiresAt) > Date.now() + 1000) return currentLease;
-    controlLeaseRef.current = null;
+    const held = currentLease?.status === "ACTIVE" && currentLease.sessionId === session.sessionId && Date.parse(currentLease.expiresAt) > Date.now() + 1000;
+    if (held && !renew) return currentLease;
+    if (!held) controlLeaseRef.current = null;
     if (controlAcquirePromiseRef.current) return controlAcquirePromiseRef.current;
     const acquisition = api.acquireBrowserControl(pane.id, {
       holderType: "OPERATOR",
@@ -1476,14 +1577,20 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
     scrollPaneIntoView(paneRef.current);
     setPending(true);
     setError(null);
-    const lease = await acquireControlForInput();
+    const lease = await acquireControlForInput(true);
     if (!lease && !legacyControlRef.current) {
       setPending(false);
       return;
     }
     setHandoff(true);
-    setTextInputOpen(true);
     setPending(false);
+    // A copilot's operator works in the page itself (a login, a CAPTCHA): keys go to the focused live view and the
+    // toolbar's "Type into page" stays one click away. A plain Browser pane opens the text box as before.
+    if (pane.mode === "JOB_APPLY" || pane.mode === "MARKETING_COPILOT" || pane.mode === "FREELANCE_COPILOT") {
+      window.setTimeout(() => canvasRef.current?.focus(), 0);
+      return;
+    }
+    setTextInputOpen(true);
     window.setTimeout(() => handoffInputRef.current?.focus(), 0);
   }
 
@@ -1495,9 +1602,12 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
         const next = await api.releaseBrowserControl(pane.id, { leaseId: controlLease.leaseId });
         setControlLease(next.lease);
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Browser control release failed");
-        setPending(false);
-        return;
+        // 409: the lease already ended (the server's idle release or its expiry), so the agent has the browser again.
+        if (!(typeof err === "object" && err !== null && "status" in err && err.status === 409)) {
+          setError(err instanceof Error ? err.message : "Browser control release failed");
+          setPending(false);
+          return;
+        }
       }
       setPending(false);
     }
@@ -1507,56 +1617,23 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
     setHandoff(false);
     setTextInputOpen(false);
   }
+  releaseControlRef.current = releaseControl;
 
-  async function saveBookmark() {
-    if (!session || bookmarksPending) return;
-    setBookmarksPending(true);
-    setError(null);
-    setBookmarkNotice(null);
+  /** Saves a tab's page with the Google account it is open in (its own, else the pane's) to the Bookmarks every browser pane shares. */
+  async function saveTabToBookmarks(page: BrowserPageSummaryPayload) {
+    setTabMenu(null);
+    const paneAccount = googleAccounts ? effectiveAccountId(googleAccounts) : privatePaneProfileId;
+    // The private pane profile belongs to this pane only, so a bookmark keeps it as "the pane's account".
+    const profileId = page.account?.profileId ?? (paneAccount === privatePaneProfileId ? null : paneAccount);
+    const accountLabel = page.account ? tabAccountLabel(page.account) : profileId && googleAccounts ? accountEntryForProfile(googleAccounts, profileId)?.title ?? null : null;
+    // Without the site's unread counter ("(1) Home / X").
+    const title = page.title?.trim().replace(/^\(\d+\+?\)\s*/, "").slice(0, 200);
     try {
-      const next = await api.addBrowserBookmark(pane.id);
-      setBookmarks(next.bookmarks);
-      setBookmarksLoaded(true);
-      setBookmarksOpen(true);
-      setBookmarkNotice("Saved");
+      await api.createMarketingBookmark({ url: page.url!, ...(title ? { title } : {}), profileId, accountLabel });
+      window.dispatchEvent(new CustomEvent(MARKETING_BOOKMARKS_CHANGED_EVENT, { detail: { paneId: pane.id } }));
+      setCaptureNotice(`Saved to Bookmarks${accountLabel ? ` with ${accountLabel}` : ""}.`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Browser bookmark failed to save");
-    } finally {
-      setBookmarksPending(false);
-    }
-  }
-
-  async function importBookmarks(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0] ?? null;
-    event.target.value = "";
-    if (!session || !file || bookmarksPending) return;
-    setBookmarksPending(true);
-    setError(null);
-    setBookmarkNotice(null);
-    try {
-      const next = await api.importBrowserBookmarks(pane.id, file);
-      setBookmarks(next.bookmarks);
-      setBookmarksLoaded(true);
-      setBookmarksOpen(true);
-      setBookmarkNotice(`Imported ${next.importedCount}; skipped ${next.skippedCount}`);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Browser bookmark import failed");
-    } finally {
-      setBookmarksPending(false);
-    }
-  }
-
-  async function openBookmark(bookmark: BrowserBookmark) {
-    if (!session || bookmarksPending) return;
-    setBookmarksPending(true);
-    setError(null);
-    try {
-      applyResponse(await api.openBrowserBookmark(pane.id, bookmark.id));
-      setBookmarksOpen(false);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Browser bookmark failed to open");
-    } finally {
-      setBookmarksPending(false);
+      setError(err instanceof Error ? err.message : "The bookmark could not be saved.");
     }
   }
 
@@ -1591,24 +1668,37 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
     if (!session) return;
     // A bare hover is not an interaction: it must not take the browser from an agent (Job Copilot) and keep it
     // through the lease heartbeat. Hover reaches the page only while a click, scroll or key already holds control.
-    if (input.type === "POINTER" && input.eventType === "mouseMoved" && input.button === "none") {
+    const hover = input.type === "POINTER" && input.eventType === "mouseMoved" && input.button === "none";
+    if (hover) {
       const held = controlLeaseRef.current;
       if (!held || held.status !== "ACTIVE" || held.sessionId !== session.sessionId || Date.parse(held.expiresAt) <= Date.now()) return;
     }
-    const lease = await acquireControlForInput();
+    const lease = await acquireControlForInput(false, !hover);
     if (lease) {
+      if ((input.type === "POINTER" && input.eventType === "mouseReleased") || (input.type === "TOUCH" && input.eventType === "touchEnd")) browserSelect.afterRelease(session.sessionId);
       const payload = { ...input, leaseId: lease.leaseId } as BrowserInputPayload;
       if (sendRealtimeBrowserInput(payload)) return;
+      // Without the stream socket, inputs go over HTTP one at a time in order, moves coalesced: one POST per
+      // pointer event queued 174 requests of 3-6 s each (stable 2026-10-24).
+      const http = httpBrowserInputRef.current;
+      queueBrowserHttpInput(http.queue, payload);
+      if (http.busy) return;
+      http.busy = true;
       try {
-        const result = await api.browserInput(pane.id, payload);
-        appendFrame(result.frame);
+        for (let next = http.queue.shift(); next; next = http.queue.shift()) {
+          const result = await api.browserInput(pane.id, next);
+          appendFrame(result.frame);
+        }
         return;
       } catch (err) {
+        http.queue.length = 0;
         if (!isUnavailableV2Feature(err)) {
           setError(err instanceof Error ? err.message : "Browser input failed");
           return;
         }
         legacyControlRef.current = true;
+      } finally {
+        http.busy = false;
       }
     }
     if (!legacyControlRef.current) return;
@@ -1645,6 +1735,26 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
     if (input.type === "KEY" && (input.eventType === "keyDown" || input.eventType === "char") && input.text) {
       appendFrame((await api.browserAction(pane.id, { type: "type", text: input.text, sessionId: session.sessionId })).frame);
     }
+  }
+
+  /** The toolbar's Paste: clipboard text into the page's focused field. When the app may not read the clipboard
+   * (or it holds no text), the text box opens, where Ctrl+V always works. */
+  async function pasteClipboard() {
+    const text = await getSpaceRuntime().platform.clipboard?.readText().catch(() => "");
+    if (text) {
+      await sendCanvasInput({ type: "KEY", eventType: "char", key: "Unidentified", text, modifiers: 0 });
+      canvasRef.current?.focus();
+      return;
+    }
+    if (!(await acquireControlForInput()) && !legacyControlRef.current) return;
+    setTextInputOpen(true);
+    window.setTimeout(() => handoffInputRef.current?.focus(), 0);
+  }
+
+  async function sendPageKey(key: "Enter" | "Backspace") {
+    const base = { type: "KEY" as const, key, code: key, modifiers: 0 };
+    await sendCanvasInput({ ...base, eventType: "keyDown", ...(key === "Enter" ? { text: "\r" } : {}) });
+    await sendCanvasInput({ ...base, eventType: "keyUp" });
   }
 
   async function sendText(event: FormEvent<HTMLFormElement>) {
@@ -1685,11 +1795,7 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
       const detail = parseBrowserPaneActionDetail(event.detail);
       if (!detail || detail.paneId !== pane.id) return;
       if (detail.action === "bookmarks") {
-        void openBookmarks();
-        return;
-      }
-      if (detail.action === "import") {
-        void openBookmarkImport();
+        openBookmarks();
         return;
       }
       if (detail.action === "handoff") {
@@ -1699,6 +1805,16 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
       // Job Copilot "Return to agent": the operator gives the browser back without the toolbar.
       if (detail.action === "release") {
         void releaseControl();
+        return;
+      }
+      // A copilot opened a tab through the API (a Marketing bookmark): show it in the strip now, not at the next poll.
+      if (detail.action === "tabs") {
+        void loadPages();
+        return;
+      }
+      // Freelance Copilot Setup changed the pane's routes: Chrome restarts with them on the same page.
+      if (detail.action === "restart") {
+        void restartBrowser();
         return;
       }
       // Job Copilot Setup chooses the pane's Google account outside the toolbar.
@@ -1722,7 +1838,7 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
         title: session ? "Browser bookmarks" : "Start a browser session before using bookmarks.",
         ariaLabel: `Browser bookmarks ${pane.title}`,
         icon: Bookmark,
-        onClick: () => void toggleBookmarks(),
+        onClick: () => setBookmarksOpen((open) => !open),
         disabled: !session || pending,
         ariaExpanded: bookmarksOpen,
         className: bookmarksOpen ? "selected" : ""
@@ -1841,6 +1957,7 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
     active: googleAccountMenuOpen,
     onDismiss: () => setGoogleAccountMenuOpen(false)
   });
+  useDismissibleToolbarLayer({ containerRef: tabMenuRef, active: Boolean(tabMenu), onDismiss: () => setTabMenu(null) });
   useDismissibleToolbarLayer({
     containerRef: browserToolbarRef,
     active: bookmarksOpen || recordingControlsOpen || textInputOpen || browserToolbar.isOverflowOpen || Boolean(browserToolbar.actionMenu),
@@ -1876,17 +1993,23 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
           {(emptyBrowser ? [] : pages).map((page) => {
             const selected = activePageId ? page.pageId === activePageId : page.isActive;
             return (
-              <div key={page.pageId} data-browser-page-id={page.pageId} className={`browser-tab${selected ? " selected" : ""}`}>
+              <div key={page.pageId} data-browser-page-id={page.pageId} className={`browser-tab${selected ? " selected" : ""}`}
+                onContextMenu={!observerOnly && /^https?:\/\//i.test(page.url ?? "") ? (event) => {
+                  event.preventDefault();
+                  setTabMenu({ page, x: event.clientX, y: event.clientY });
+                } : undefined}>
                 <button
                   type="button"
                   role="tab"
                   aria-selected={selected}
-                  aria-label={page.title ?? page.url ?? "Browser tab"}
-                  title={page.url ?? page.title ?? "Browser tab"}
+                  aria-label={[page.title ?? page.url ?? "Browser tab", page.account ? tabAccountLabel(page.account) : null].filter(Boolean).join(" · ")}
+                  title={[page.url ?? page.title ?? "Browser tab", page.account ? `Google account: ${tabAccountLabel(page.account)}` : null].filter(Boolean).join("\n")}
                   disabled={observerOnly || pending || session?.status === "CLOSED" || page.pageId.startsWith("legacy:")}
                   onClick={() => void activatePage(page.pageId)}
                 >
-                  <Globe2 aria-hidden="true" />
+                  {page.account ? <span className="account-menu-avatar browser-tab-account" aria-hidden="true"
+                    style={{ "--account-hue": avatarHue(tabAccountLabel(page.account)) } as CSSProperties}>
+                    {tabAccountLabel(page.account).charAt(0).toUpperCase()}</span> : <Globe2 aria-hidden="true" />}
                   <span>{page.title ?? page.url ?? "New tab"}</span>
                 </button>
                 {!page.pageId.startsWith("legacy:") ? (
@@ -1908,12 +2031,18 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
         <button type="button" className="browser-new-tab" aria-label={`New browser tab ${pane.title}`} title="New tab" onClick={() => void createPage()} disabled={observerOnly || !status?.enabled || pending}>
           <Plus aria-hidden="true" />
         </button>
+        {tabMenu ? (
+          <div ref={tabMenuRef} className="icon-context-menu" role="menu" aria-label={`Tab menu ${tabMenu.page.title ?? tabMenu.page.url ?? "tab"}`}
+            style={{ left: `${tabMenu.x}px`, top: `${tabMenu.y}px` }}>
+            <button type="button" role="menuitem" onClick={() => void saveTabToBookmarks(tabMenu.page)}><BookmarkPlus aria-hidden="true" /> Save to bookmarks</button>
+          </div>
+        ) : null}
       </div>
       <div className={`browser-pane-toolbar${compactToolbar ? " browser-toolbar-compact" : ""}`} data-toolbar-width={toolbarWidth}>
       {googleAccounts?.profiles.length ? <div ref={googleAccountPickerRef} className="browser-account-picker"
         onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setGoogleAccountMenuOpen(false); }}
         onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); setGoogleAccountMenuOpen(false); googleAccountButtonRef.current?.focus(); } }}>
-        <button ref={googleAccountButtonRef} type="button" className={`browser-account-trigger${effectiveAccountId(googleAccounts) !== privatePaneProfileId ? " selected" : ""}`}
+        <button ref={googleAccountButtonRef} type="button" className={`browser-account-trigger${effectiveAccountId(menuAccounts ?? googleAccounts) !== privatePaneProfileId ? " selected" : ""}`}
           data-account-status={googleAccountSummary?.tone}
           aria-label={`Google account for ${pane.title}`} aria-haspopup="menu" aria-expanded={googleAccountMenuOpen}
           title={`Google account: ${[googleAccountSummary?.name, googleAccountSummary?.status].filter(Boolean).join(" · ")}`}
@@ -1923,8 +2052,9 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
             setGoogleAccountMenuOpen(!googleAccountMenuOpen);
           }}><Users aria-hidden="true" /></button>
         {googleAccountMenuOpen ? <div className="browser-account-menu" role="menu" aria-label={`Google accounts for ${pane.title}`}>
-          <GoogleAccountMenuItems accounts={googleAccounts} onSelect={(profileId) => void selectGoogleAccount(profileId)}
-            onSignIn={(profileId) => void selectGoogleAccount(profileId, true)} />
+          <GoogleAccountMenuItems accounts={menuAccounts ?? googleAccounts} onSelect={(profileId) => void chooseGoogleAccount(profileId)}
+            onSignIn={(profileId) => void (tabScoped && activeTab?.account ? switchTabAccount(activeTab.pageId, profileId, true) : selectGoogleAccount(profileId, true))}
+            scope={tabScoped ? "This tab" : undefined} />
         </div> : null}
       </div> : null}
         <form onSubmit={navigate} className="browser-url-form">
@@ -2008,6 +2138,10 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
           </button> : null}
           </> : null}
           <div ref={browserToolbarRef} className="browser-pane-actions" aria-label={`Browser toolbar actions ${pane.title}`}>
+            <button type="button" title="Paste clipboard text into the page" aria-label={`Paste into browser ${pane.title}`}
+              onClick={() => void pasteClipboard()} disabled={observerOnly || !session || session.status === "CLOSED" || pending}>
+              <Clipboard aria-hidden="true" />
+            </button>
             <div className="pane-actions-overflow browser-toolbar-overflow">
             <button
               type="button"
@@ -2115,62 +2249,8 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
             ) : null}
           </div>
           {bookmarksOpen ? (
-            <div className="browser-bookmark-popover toolbar-floating-menu" role="menu" aria-label={`Saved browser bookmarks ${pane.title}`}>
-              <button
-                type="button"
-                className="browser-bookmark-command"
-                title="Save current browser page"
-                aria-label={`Save current browser page ${pane.title}`}
-                onClick={() => void saveBookmark()}
-                disabled={!session || bookmarksPending}
-                role="menuitem"
-              >
-                <BookmarkPlus aria-hidden="true" />
-                <span>Save page</span>
-              </button>
-              <button
-                type="button"
-                className="browser-bookmark-command"
-                title="Import Chrome bookmarks JSON"
-                aria-label={`Import browser bookmarks ${pane.title}`}
-                onClick={() => bookmarkImportRef.current?.click()}
-                disabled={!session || bookmarksPending}
-                role="menuitem"
-              >
-                <Upload aria-hidden="true" />
-                <span>Import JSON</span>
-              </button>
-              <a
-                className="browser-bookmark-command"
-                href={api.browserBookmarksExportUrl(pane.id)}
-                download
-                role="menuitem"
-                aria-label={`Export browser bookmarks ${pane.title}`}
-                title="Export managed bookmarks JSON"
-              >
-                <Download aria-hidden="true" />
-                <span>Export JSON</span>
-              </a>
-              <input
-                ref={bookmarkImportRef}
-                className="sr-only"
-                type="file"
-                name={`browser-bookmarks-${pane.id}`}
-                accept="application/json,.json"
-                aria-label={`Browser bookmark import file ${pane.title}`}
-                onChange={(event) => void importBookmarks(event)}
-              />
-              <div className="browser-bookmark-list" role="none">
-                {bookmarksPending ? <span role="status">Loading...</span> : null}
-                {!bookmarksPending && bookmarkNotice ? <span role="status">{bookmarkNotice}</span> : null}
-                {!bookmarksPending && bookmarks.length === 0 ? <span role="status">No bookmarks</span> : null}
-                {bookmarks.map((bookmark) => (
-                  <button key={bookmark.id} type="button" role="menuitem" aria-label={`Open bookmark ${bookmark.title}`} onClick={() => void openBookmark(bookmark)} disabled={bookmarksPending}>
-                    <Bookmark aria-hidden="true" />
-                    <span>{bookmark.title}</span>
-                  </button>
-                ))}
-              </div>
+            <div className="browser-bookmark-popover toolbar-floating-menu jc-pane" role="dialog" aria-label={`Saved browser bookmarks ${pane.title}`}>
+              <BookmarksTab paneId={pane.id} popover onOpened={() => setBookmarksOpen(false)} />
             </div>
           ) : null}
           {textInputOpen ? (
@@ -2179,6 +2259,12 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
                 ref={handoffInputRef}
                 value={textInput}
                 onChange={(event) => setTextInput(event.target.value)}
+                onKeyDown={(event) => {
+                  // An empty box passes Enter and Backspace to the page: a phone can submit or correct a field without a canvas keyboard.
+                  if (textInput || event.nativeEvent.isComposing || (event.key !== "Enter" && event.key !== "Backspace")) return;
+                  event.preventDefault();
+                  void sendPageKey(event.key);
+                }}
                 aria-label={`Browser text input ${pane.title}`}
                 placeholder="Type into page"
                 disabled={!handoff || !session}
@@ -2311,11 +2397,23 @@ export function BrowserPane({ pane, agentNumber, observerOnly = false, uiTheme =
             source={emptyBrowser ? undefined : activeFrame?.screenshotDataUrl}
             capturedAt={activeFrame?.capturedAt}
             onInput={(input) => void sendCanvasInput(input)}
+            overlay={browserSelect.render}
           />
           {emptyBrowser || !activeFrame?.screenshotDataUrl ? (
             <div className="browser-frame-empty" role="status">
               {pending ? <Loader2 aria-hidden="true" /> : emptyBrowser || session?.status === "CLOSED" ? <span>No open tabs. Use + to open a new tab.</span> : <MousePointer2 aria-hidden="true" />}
             </div>
+          ) : null}
+          {browserAgent && browserAgent.paneId !== pane.id && !handoff && !emptyBrowser && session?.status !== "CLOSED" ? (
+            <button
+              type="button"
+              className="browser-agent-label"
+              data-active={browserAgent.active ? "true" : "false"}
+              title={`${browserAgent.active ? "Handled" : `Last handled ${relativeTime(browserAgent.drivenAt)}`} by ${browserAgent.paneName ?? browserAgent.title} in room ${browserAgent.roomName}. Click to go to that pane.`}
+              onClick={() => requestNousFocus({ roomId: browserAgent.roomId, paneId: browserAgent.paneId, immediate: true })}
+            >
+              {browserAgent.active ? "" : "Last: "}{[browserAgent.roomName, browserAgent.paneName, browserAgent.title, browserAgent.active ? null : relativeTime(browserAgent.drivenAt)].filter(Boolean).join(" · ")}
+            </button>
           ) : null}
           {selectedFrameIndex !== null ? <span className="browser-frame-paused">Frame {selectedFrameIndex + 1} / {canvasHistoryLength}</span> : null}
         </div>

@@ -1,6 +1,8 @@
 import { createLiveHistorySync } from "../src/features/live-pane/live-history-sync.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createLiveCoordinator } from "../src/features/live-pane/live-coordinator.js";
+import { getLiveSessionStats } from "../src/features/live-pane/live-stats.js";
+import { noteLiveUserTurn } from "../src/features/live-pane/live-command-origin.js";
 import type { LiveSessionCallbacks, LiveSessionHandle, LiveSessionOptions } from "../src/features/live-pane/live-session.js";
 import type { LiveRoomContext } from "@space/contracts";
 const context = (roomId: string, revision = roomId): LiveRoomContext => ({ roomId, name: roomId, description: null, objective: null, panes: [], revision, checkedAt: "2026-09-26" });
@@ -16,12 +18,18 @@ function fixture(overrides: Partial<Parameters<typeof createLiveCoordinator>[0]>
 }
 afterEach(() => { for (const item of owned.splice(0)) item.dispose(); vi.useRealTimers(); });
 describe("application Live coordinator", () => {
-  it("permanently invalidates queued commands after another utterance, navigation away and back, or stop", async () => {
+  it("keeps queued commands while the user keeps talking, and drops them after a refusal, navigation away and back, or stop", async () => {
     const f = fixture(); await f.coordinator.start();
     f.callbacks().onInputStart?.();
     const first = f.options().captureCommandRoom!();
     expect(first()).toBe("room:a");
-    f.callbacks().onInputEnd?.(); f.callbacks().onInputStart?.();
+    // "Can you hear me?" in the same room keeps the command (operator review 2026-10-15).
+    f.callbacks().onInputEnd?.(); noteLiveUserTurn(); f.callbacks().onInputStart?.();
+    f.callbacks().onTranscriptUpdate?.({ id: "hear", role: "user", text: "Can you hear me?", timestamp: "" });
+    expect(first()).toBe("room:a");
+    // A later "no, wait" drops it.
+    f.callbacks().onInputEnd?.(); noteLiveUserTurn(); f.callbacks().onInputStart?.();
+    f.callbacks().onTranscriptUpdate?.({ id: "wait", role: "user", text: "Όχι, περίμενε", timestamp: "" });
     expect(first()).toBeUndefined();
     const second = f.options().captureCommandRoom!();
     f.coordinator.setRoom("room:b"); await f.coordinator.refreshContext();
@@ -29,7 +37,7 @@ describe("application Live coordinator", () => {
     expect(second()).toBeUndefined();
     f.coordinator.send([{ type: "text", text: "Read this room" }]);
     const typed = f.options().captureCommandRoom!(); expect(typed()).toBe("room:a");
-    f.coordinator.send([{ type: "text", text: "Read it again" }]); expect(typed()).toBeUndefined();
+    f.coordinator.send([{ type: "text", text: "Read it again" }]); expect(typed()).toBe("room:a");
     const stopped = f.options().captureCommandRoom!(); f.coordinator.stop(); expect(stopped()).toBeUndefined();
   });
   it("switches rooms without reacquiring audio and blocks an utterance crossing rooms", async () => {
@@ -65,6 +73,45 @@ describe("application Live coordinator", () => {
     expect(f.coordinator.getSnapshot()).toMatchObject({ enabled: false, status: "error", error: "Responses configuration validation failed." });
     f.coordinator.toggle(); await vi.advanceTimersByTimeAsync(0);
     expect(f.open).toHaveBeenCalledTimes(2);
+  });
+  // Mobile 2026-10-22: a restored Live retried a call OpenAI refused (no credits) every 32 s, and each try opened the
+  // phone's microphone, pausing the operator's music.
+  it("turns Live off instead of retrying a connection that fails to open, also after the next app start", async () => {
+    vi.useFakeTimers();
+    const records = new Map<string, string>(); const storage = { getItem: (k: string) => records.get(k) ?? null, setItem: (k: string, v: string) => { records.set(k, v); } };
+    const open = vi.fn(async (_options: LiveSessionOptions, cb: LiveSessionCallbacks): Promise<LiveSessionHandle> => {
+      cb.onStatusChange?.("connecting"); cb.onError?.("OpenAI API quota or credit balance exhausted.", { retryable: true });
+      cb.onStatusChange?.("error"); cb.onStatusChange?.("idle");
+      throw new Error("OpenAI API quota or credit balance exhausted.");
+    });
+    const f = fixture({ open, storage }); await f.coordinator.start();
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(f.coordinator.getSnapshot()).toMatchObject({ enabled: false, status: "error", error: "OpenAI API quota or credit balance exhausted." });
+    f.coordinator.dispose(); const next = fixture({ open, storage }); await vi.advanceTimersByTimeAsync(60_000);
+    expect(open).toHaveBeenCalledTimes(1); expect(next.coordinator.getSnapshot().enabled).toBe(false);
+    next.coordinator.toggle(); await vi.advanceTimersByTimeAsync(0);
+    expect(open).toHaveBeenCalledTimes(2);
+  });
+  it("in the phone app brings Live left on back off after a reload, mute kept, until one tap starts it", async () => {
+    const records = new Map<string, string>(); const storage = { getItem: (k: string) => records.get(k) ?? null, setItem: (k: string, v: string) => { records.set(k, v); } };
+    const f = fixture({ storage }); await f.coordinator.start(); f.coordinator.setMuted(true); f.coordinator.dispose();
+    const next = fixture({ storage, restoreEnabled: false }); await new Promise(resolve => setTimeout(resolve, 20));
+    expect(next.open).not.toHaveBeenCalled();
+    expect(next.coordinator.getSnapshot()).toMatchObject({ enabled: false, muted: true, status: "idle" });
+    next.coordinator.toggle(); await vi.waitFor(() => expect(next.open).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(next.transport.setMuted).toHaveBeenCalledWith(true));
+  });
+  it("reconnects a dropped live conversation once and gives up when that reconnect fails to open", async () => {
+    vi.useFakeTimers();
+    const f = fixture(); await f.coordinator.start();
+    f.open.mockImplementationOnce(async () => { throw new Error("Network down"); });
+    f.callbacks().onStatusChange?.("idle");
+    await vi.advanceTimersByTimeAsync(500);
+    expect(f.open).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(f.open).toHaveBeenCalledTimes(2);
+    expect(f.coordinator.getSnapshot()).toMatchObject({ enabled: false, status: "error", error: "Network down" });
   });
   it("ignores stale room context responses", async () => {
     let resolve!: (c: LiveRoomContext) => void;
@@ -119,19 +166,54 @@ describe("application Live coordinator", () => {
     await vi.advanceTimersByTimeAsync(2000); expect(ack).toHaveBeenCalledTimes(2); expect(saved).toHaveLength(1);
     expect(f.coordinator.getSnapshot().transcripts).toMatchObject([{ id: "watch:watch:one", roomId: "room:origin" }]);
   });
+  it("opens the session without waiting for the room context, then hands it over, and records connect and reply latency", async () => {
+    let resolveContext!: (value: LiveRoomContext) => void;
+    const f = fixture({ context: () => new Promise(resolve => { resolveContext = resolve; }) });
+    await f.coordinator.start();
+    expect(f.open).toHaveBeenCalledTimes(1);
+    expect(f.options().roomContext).toBeUndefined();
+    expect(getLiveSessionStats().connectMs).toBeGreaterThanOrEqual(0);
+    resolveContext(context("room:a")); await f.coordinator.refreshContext();
+    expect(f.transport.updateContext).toHaveBeenCalledWith(expect.objectContaining({ roomId: "room:a" }));
+    vi.useFakeTimers(); vi.setSystemTime(10_000);
+    f.callbacks().onInputEnd?.();
+    vi.setSystemTime(10_420);
+    f.callbacks().onStatusChange?.("speaking");
+    expect(getLiveSessionStats().lastReplyMs).toBe(420);
+  });
+  it("acknowledges a watch cancelled by its pane closing without showing or speaking it, and still speaks a finished task", async () => {
+    vi.useFakeTimers();
+    const history = createLiveHistorySync({ load: async () => ({ items: [], epochs: {} }), save: async turns => ({ receipts: turns.map(turn => ({ id: turn.item.id, sessionId: turn.item.sessionId, accepted: true })) }), clear: async () => ({ ok: true, epoch: 1 }) });
+    const acked = new Set<string>();
+    const watches = [
+      { id: "closed", roomId: "room:a", paneId: "pane:bob", status: "CANCELLED", reason: "Target pane was closed." },
+      { id: "done", roomId: "room:a", paneId: "pane:andy", status: "VERIFIED", reason: null }
+    ];
+    const list = vi.fn(async () => watches.filter(watch => !acked.has(watch.id)) as any);
+    const ack = vi.fn(async (_roomId: string, id: string) => { acked.add(id); });
+    const f = fixture({ history, notifications: { list, ack, visible: () => true } });
+    const notify = vi.fn(); (f.transport as any).notify = notify;
+    await f.coordinator.start();
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(ack).toHaveBeenCalledWith("room:a", "closed");
+    // A cancelled watch is acknowledged only: no conversation entry (agents' test rooms raised dozens of them).
+    expect(f.coordinator.getSnapshot().transcripts.map(item => item.id)).toEqual(["watch:done"]);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("Task completed"), "watch:done");
+  });
   it("speaks the Room Agent's questions once, after watches, and marks them announced", async () => {
     vi.useFakeTimers(); const saved: any[] = [];
     const history = createLiveHistorySync({ load: async () => ({ items: [], epochs: {} }), save: async turns => { saved.push(...turns); return { receipts: turns.map(turn => ({ id: turn.item.id, sessionId: turn.item.sessionId, accepted: true })) }; }, clear: async () => ({ ok: true, epoch: 1 }) });
     const announced = new Set<string>();
     const announcements = {
-      list: vi.fn(async () => [{ id: "room_agent_event:ask", roomId: "room:origin", text: "Room Agent: Dana is waiting: Permission prompt." }].filter(item => !announced.has(item.id))),
+      list: vi.fn(async () => [{ id: "room_agent_event:ask", roomId: "room:origin", roomName: "Alex", text: "Room Agent: Dana is waiting: Permission prompt." }].filter(item => !announced.has(item.id))),
       ack: vi.fn((id: string) => { announced.add(id); })
     };
     const f = fixture({ history, notifications: { list: vi.fn(async () => []), ack: vi.fn(async () => undefined), visible: () => true }, announcements });
     await f.coordinator.start();
     await vi.advanceTimersByTimeAsync(2000);
     expect(announcements.ack).toHaveBeenCalledWith("room_agent_event:ask");
-    expect(f.coordinator.getSnapshot().transcripts).toMatchObject([{ id: "room-agent:room_agent_event:ask", text: "Room Agent: Dana is waiting: Permission prompt." }]);
+    expect(f.coordinator.getSnapshot().transcripts).toMatchObject([{ id: "room-agent:room_agent_event:ask", roomName: "Alex", text: "Room Agent: Dana is waiting: Permission prompt." }]);
     await vi.advanceTimersByTimeAsync(4000);
     expect(f.coordinator.getSnapshot().transcripts).toHaveLength(1);
     expect(saved).toHaveLength(1);

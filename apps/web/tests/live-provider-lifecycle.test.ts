@@ -21,12 +21,15 @@ function openAIHarness() {
     inspectRoomMission, reportLiveVoiceLog: vi.fn(async () => ({})) } as any,
     platform: { ...liveRuntime.platform, userMediaSupported: true, peerConnectionSupported: true,
       getUserMedia: vi.fn(async () => stream as any), createPeerConnection: () => connection as any } });
-  return { sent: channel.send, channel, inspectRoomMission, open: () => handlers.get("open")?.({}), receive: (data: object) => handlers.get("message")?.({ data: JSON.stringify(data) }) };
+  const emitTrack = (event: object) => connection.addEventListener.mock.calls.filter(([type]) => type === "track").forEach(([, fn]) => (fn as (event: object) => void)(event));
+  return { sent: channel.send, channel, inspectRoomMission, emitTrack, open: () => handlers.get("open")?.({}), receive: (data: object) => handlers.get("message")?.({ data: JSON.stringify(data) }) };
 }
 
-function harness(protocol: "google-live" | "gateway-realtime") {
+function harness(protocol: "google-live" | "gateway-realtime" | "fish-cascade") {
   const processors: any[] = [];
   const contexts: any[] = [];
+  const taps: any[] = [];
+  const playbackNodes: any[] = [];
   const track = { enabled: true, stop: vi.fn() };
   const stream = { getTracks: () => [track], getAudioTracks: () => [track] };
   class Context {
@@ -37,6 +40,9 @@ function harness(protocol: "google-live" | "gateway-realtime") {
     createMediaStreamSource() { return { connect: vi.fn(), disconnect: vi.fn() }; }
     createScriptProcessor() { const node = { connect: vi.fn(), disconnect: vi.fn(), onaudioprocess: undefined }; processors.push(node); return node; }
     createGain() { return { gain: { value: 1 }, connect: vi.fn(), disconnect: vi.fn() }; }
+    createMediaStreamDestination() { const node = { stream: { id: "tap" }, connect: vi.fn() }; taps.push(node); return node; }
+    createBuffer(_channels: number, length: number) { return { duration: length / 24000, getChannelData: () => new Float32Array(length) }; }
+    createBufferSource() { const node = { buffer: null, connect: vi.fn(), disconnect: vi.fn(), start: vi.fn(), stop: vi.fn(), onended: null }; playbackNodes.push(node); return node; }
   }
   const sockets: Socket[] = [];
   class Socket {
@@ -55,11 +61,49 @@ function harness(protocol: "google-live" | "gateway-realtime") {
   const processAudio = (level = 0) => processors[0].onaudioprocess({ inputBuffer: { getChannelData: () => new Float32Array(100).fill(level) } });
   const open = () => { sockets[0]!.readyState = 1; sockets[0]!.onopen?.({}); };
   const receive = (data: object) => sockets[0]!.onmessage?.({ data: JSON.stringify(data) });
-  return { contexts, processors, track, sockets, open, receive, processAudio, createVoiceRealtimeCall, getUserMedia, inspectRoomMission, delegateVoiceIntent };
+  return { contexts, processors, taps, playbackNodes, stream, track, sockets, open, receive, processAudio, createVoiceRealtimeCall, getUserMedia, inspectRoomMission, delegateVoiceIntent };
 }
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); vi.useRealTimers(); installSpaceRuntime(liveRuntime); });
 
 describe("voice provider readiness and cleanup", () => {
+  it("taps the Google reply for the session recorder without a second playout", async () => {
+    const h = harness("google-live");
+    const session = await openGoogleGeminiConversationSession({ model: "gemini-3.8-live", getCommandRoom: () => "room:a" });
+    try {
+      h.open(); await h.receive({ setupComplete: {} });
+      const chunk = { serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm", data: "AAAAAA==" } }] } } };
+      await h.receive(chunk);
+      expect(h.taps).toHaveLength(0);
+      expect(h.playbackNodes[0].connect).toHaveBeenCalledTimes(1);
+      expect(session.microphone).toBe(h.stream);
+      const tapped = session.tapPlayback!();
+      expect(session.tapPlayback!()).toBe(tapped);
+      expect(h.taps).toHaveLength(1);
+      await h.receive(chunk);
+      // The played node reaches the speakers and the tap; the tap itself is never connected to the destination.
+      expect(h.playbackNodes[1].connect.mock.calls.map((call: any[]) => call[0])).toEqual([h.contexts[1].destination, h.taps[0]]);
+      expect(h.taps[0].connect).not.toHaveBeenCalled();
+    } finally { session.close(); }
+  });
+
+  it("plays the OpenAI reply through one path only, so echo cancellation sees one source", async () => {
+    const h = openAIHarness();
+    const webAudioSources = vi.fn();
+    vi.stubGlobal("AudioContext", class { state = "running"; destination = {};
+      createMediaStreamSource(stream: unknown) { webAudioSources(stream); return { connect: vi.fn() }; }
+      createAnalyser() { return { fftSize: 0, frequencyBinCount: 1, getByteFrequencyData: vi.fn(), getByteTimeDomainData: vi.fn(), connect: vi.fn() }; }
+      resume = vi.fn(async () => {}); close = vi.fn(async () => {}); });
+    const onRemoteStream = vi.fn();
+    const remote = { id: "remote" };
+    const session = await openLiveConversationSession({ model: "gpt-realtime-mini", getCommandRoom: () => "room:a" }, { onRemoteStream });
+    const audioBefore = document.querySelectorAll("audio").length;
+    try {
+      h.emitTrack({ streams: [remote] });
+      expect(onRemoteStream).toHaveBeenCalledExactlyOnceWith(remote);
+      expect(document.querySelectorAll("audio")).toHaveLength(audioBefore);
+      expect(webAudioSources).not.toHaveBeenCalledWith(remote);
+    } finally { session.close(); }
+  });
   it("rejects late legacy Gateway delegation and resumes after a completed turn", async () => {
     const h = harness("gateway-realtime"); let room = "room:a";
     const session = await openVercelLiveConversationSession({ model: "openai/gpt-live-1", getCommandRoom: () => room });
@@ -124,27 +168,97 @@ describe("voice provider readiness and cleanup", () => {
     } finally { session.close(); }
   });
 
-  it("does not assign either of two unresolved inputs to a delayed OpenAI response", async () => {
+  it.each([false, true])("runs a delayed OpenAI response after two inputs, reconnecting only when they were in different rooms (room changed: %s)", async changed => {
     const h = openAIHarness();
     const onError = vi.fn();
-    const session = await openLiveConversationSession({ model: "gpt-realtime-mini", getCommandRoom: () => "room:a" }, { onError });
+    let room = "room:a";
+    const session = await openLiveConversationSession({ model: "gpt-realtime-mini", getCommandRoom: () => room }, { onError });
     try {
       h.open(); await h.receive({ type: "session.created" });
       await h.receive({ type: "input_audio_buffer.speech_started", item_id: "input:1" });
+      if (changed) room = "room:b";
       await h.receive({ type: "input_audio_buffer.speech_started", item_id: "input:2" });
       await h.receive({ type: "response.created", response: { id: "response:late" } });
       await h.receive({ type: "response.done", response: { id: "response:late", output: [{ type: "function_call", call_id: "call:late", name: "space_plan_mission", arguments: '{"action":"status"}' }] } });
       for (let i = 0; i < 20; i++) await Promise.resolve();
-      expect(h.inspectRoomMission).not.toHaveBeenCalled();
-      expect(h.channel.close).toHaveBeenCalledOnce();
-      expect(onError).toHaveBeenCalledWith(expect.stringContaining("Overlapping voice commands"));
+      if (changed) {
+        expect(h.inspectRoomMission).not.toHaveBeenCalled();
+        expect(h.channel.close).toHaveBeenCalledOnce();
+        expect(onError).toHaveBeenCalledWith(expect.stringContaining("Overlapping voice commands"));
+      } else {
+        // "Can you hear me?" while a command is on its way must not cancel it (operator review 2026-10-15).
+        expect(h.inspectRoomMission).toHaveBeenCalledExactlyOnceWith("room:a");
+        expect(onError).not.toHaveBeenCalled();
+      }
     } finally { session.close(); }
+  });
+
+  it("splits GPT-Live's unmarked transcript stream into turns and runs its tool calls in the speaker's room", async () => {
+    vi.useFakeTimers();
+    const h = openAIHarness();
+    const onTranscriptUpdate = vi.fn(), onInputStart = vi.fn(), onInputEnd = vi.fn();
+    const session = await openLiveConversationSession({ model: "gpt-live-1", getCommandRoom: () => "room:a" }, { onTranscriptUpdate, onInputStart, onInputEnd });
+    try {
+      h.open(); await h.receive({ type: "session.started" });
+      await h.receive({ type: "session.input_transcript.delta", delta: "Open a Claude", start_ms: 0, end_ms: 400 });
+      await h.receive({ type: "session.input_transcript.delta", delta: " pane", start_ms: 400, end_ms: 600 });
+      await h.receive({ type: "session.output_transcript.delta", delta: "Opening it." });
+      await h.receive({ type: "session.input_transcript.delta", delta: "Can you hear me?", start_ms: 3000, end_ms: 3400 });
+      await h.receive({ type: "response.created", response: { id: "delegation:1" } });
+      await h.receive({ type: "response.done", response: { id: "delegation:1", output: [{ type: "function_call", call_id: "call:open", name: "space_plan_mission", arguments: '{"action":"status"}' }] } });
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(h.inspectRoomMission).toHaveBeenCalledExactlyOnceWith("room:a");
+      const finals = onTranscriptUpdate.mock.calls.map(([item]) => item).filter(item => item.role === "user" && !item.isDelta);
+      expect(finals.map(item => item.text)).toEqual(["Open a Claude pane", "Can you hear me?"]);
+      expect(new Set(finals.map(item => item.id)).size).toBe(2);
+      expect(onInputStart).toHaveBeenCalledTimes(2);
+      expect(onInputEnd).toHaveBeenCalledTimes(2);
+    } finally { session.close(); }
+  });
+
+  it("keeps overlapping GPT-Live speech whole and shows a delegated reply once, as spoken", async () => {
+    vi.useFakeTimers();
+    const h = openAIHarness();
+    const onTranscriptUpdate = vi.fn();
+    const session = await openLiveConversationSession({ model: "gpt-live-1", getCommandRoom: () => "room:a" }, { onTranscriptUpdate });
+    try {
+      h.open(); await h.receive({ type: "session.started" });
+      // The 2026-10-15 dialogue: Live began answering while the user was still finishing the question.
+      await h.receive({ type: "session.input_transcript.delta", delta: "Τι δούλευ", start_ms: 0, end_ms: 500 });
+      await h.receive({ type: "session.output_transcript.delta", delta: "Για να σου" });
+      await h.receive({ type: "session.input_transcript.delta", delta: "ε πριν τελειώσει", start_ms: 600, end_ms: 1400 });
+      await h.receive({ type: "session.output_transcript.delta", delta: " πω ακριβώς." });
+      await vi.advanceTimersByTimeAsync(2000);
+      await h.receive({ type: "response.output_text.delta", delta: "Η **Dana** δουλεύει." });
+      await h.receive({ type: "session.output_transcript.delta", delta: "Η Dana" });
+      await h.receive({ type: "session.output_transcript.delta", delta: " δουλεύει." });
+      const items = new Map<string, { role: string; text: string }>();
+      for (const [item] of onTranscriptUpdate.mock.calls) {
+        const previous = items.get(item.id);
+        items.set(item.id, { role: item.role, text: item.isDelta && previous ? previous.text + item.text : item.text });
+      }
+      expect([...items.values()]).toEqual([
+        { role: "user", text: "Τι δούλευε πριν τελειώσει" },
+        { role: "assistant", text: "Για να σου πω ακριβώς." },
+        { role: "assistant", text: "Η Dana δουλεύει." }
+      ]);
+    } finally { session.close(); }
+  });
+
+  it("keeps one response slot for inputs in the same room", () => {
+    const onAmbiguous = vi.fn();
+    const origins = createIdentifiedLiveCommandOrigins(() => () => "room:a", 4096, onAmbiguous);
+    origins.beginInput(); origins.beginInput(); origins.responseCreated("late");
+    origins.bindCall("call:late", "late");
+    expect(origins.captureCall("call:late")()).toBe("room:a");
+    expect(onAmbiguous).not.toHaveBeenCalled();
   });
 
   it("does not reuse an ambiguous response slot for a third input", () => {
     const onAmbiguous = vi.fn();
-    const origins = createIdentifiedLiveCommandOrigins(() => () => "room:a", 4096, onAmbiguous);
-    origins.beginInput(); origins.beginInput(); origins.responseCreated("late:first");
+    let room = "room:a";
+    const origins = createIdentifiedLiveCommandOrigins(() => { const captured = room; return () => room === captured ? captured : undefined; }, 4096, onAmbiguous);
+    origins.beginInput(); room = "room:b"; origins.beginInput(); origins.responseCreated("late:first");
     origins.beginInput(); origins.responseCreated("late:second");
     origins.bindCall("old:second", "late:second");
     expect(origins.captureCall("old:second")()).toBeUndefined();
@@ -161,9 +275,11 @@ describe("voice provider readiness and cleanup", () => {
     const second = origins.captureCall("call:two");
     origins.cancelResponse("two"); expect(second()).toBeUndefined();
     origins.bindCall("call:one", "two"); expect(origins.captureCall("call:one")()).toBeUndefined();
-    origins.beginNotification(); expect(first()).toBeUndefined();
+    // A notice does not cancel the user's command, but its own response runs no tools.
+    origins.beginNotification(); expect(first()).toBe("room:a");
     origins.responseCreated("three"); origins.bindCall("call:three", "three");
     expect(origins.captureCall("call:three")()).toBeUndefined();
+    origins.invalidate(); expect(first()).toBeUndefined();
     expect(origins.expectContinuation(first)).toBe(false);
   });
 
@@ -486,6 +602,20 @@ describe("voice provider readiness and cleanup", () => {
     session.close();
   });
 
+  it("keeps the Gemini setup frame, with the full Space Control description, under the voice relay's 64 KB frame limit", async () => {
+    const h = harness("google-live");
+    const session = await openGoogleGeminiConversationSession({ model: "gemini-3.8-live" });
+    h.open();
+    const frame = h.sockets[0]!.send.mock.calls[0]![0] as string;
+    const declarations = JSON.parse(frame).setup.tools[0].functionDeclarations as Array<{ name: string; description: string }>;
+    const execute = declarations.find(tool => tool.name === "space_execute_mcp")!;
+    expect(execute.description).toContain("tasks.create");
+    expect(execute.description).not.toContain("ops.deploy");
+    // Leaves room for personal memory, prior turns and the room context added in production.
+    expect(new TextEncoder().encode(frame).length).toBeLessThan(48 * 1024);
+    session.close();
+  });
+
   it("reports a setup rejection instead of a plain disconnect when Google never acknowledges setup", async () => {
     const h = harness("google-live");
     const onError = vi.fn();
@@ -584,6 +714,16 @@ describe("voice provider readiness and cleanup", () => {
     session.close(); await vi.advanceTimersByTimeAsync(20_000);
     expect(h.track.stop).toHaveBeenCalledTimes(1);
   });
+  it("asks the Gateway for semantic turn detection on OpenAI models and transcribes both languages unless Greek only", async () => {
+    const h = harness("gateway-realtime");
+    const session = await openVercelLiveConversationSession({ model: "openai/gpt-realtime-mini", language: "en" });
+    try {
+      h.open();
+      const setup = h.sockets[0]!.send.mock.calls[0]![0] as string;
+      expect(setup).toMatch(/semantic[-_]vad/);
+      expect(setup).not.toMatch(/"language":"en"/);
+    } finally { session.close(); }
+  });
   it.each(["google-live", "gateway-realtime"] as const)("does not acquire a microphone if %s session creation fails", async (protocol) => {
     const h = harness(protocol); h.createVoiceRealtimeCall.mockRejectedValueOnce(new Error("provider unavailable"));
     const start = protocol === "google-live" ? openGoogleGeminiConversationSession : openVercelLiveConversationSession;
@@ -622,6 +762,45 @@ describe("voice provider readiness and cleanup", () => {
         .map(c => c[0])
         .filter(item => item.role === "assistant" && !item.isDelta);
       expect(assistantItems.map(i => i.text)).toEqual(["Ελέγχω την ώρα.", "Η ώρα είναι 10:00."]);
+    } finally { session.close(); }
+  });
+});
+
+describe("Fish Audio (Drama 3) provider", () => {
+  it("answers a heard turn through the delegate and a tool, speaks it with Drama 3 and stops on barge-in", async () => {
+    const h = harness("fish-cascade");
+    h.delegateVoiceIntent
+      .mockResolvedValueOnce({ toolCall: { name: "space_plan_mission", args: { action: "status" } }, message: null })
+      .mockResolvedValueOnce({ toolCall: null, message: "Η αποστολή προχωράει." });
+    const statuses: string[] = [];
+    const session = await openLiveConversationSession({ provider: "fish", model: "drama-3", getCommandRoom: () => "room:a" },
+      { onStatusChange: (status) => statuses.push(status) });
+    const sent = () => h.sockets[0]!.send.mock.calls.map(([data]) => data);
+    const json = () => sent().filter((data): data is string => typeof data === "string").map((data) => JSON.parse(data));
+    try {
+      h.processAudio(0.1);
+      expect(sent()).toHaveLength(0);
+      h.open(); await h.receive({ type: "session_started" });
+      h.processAudio(0.1);
+      expect(sent()[0]).toBeInstanceOf(ArrayBuffer);
+      await h.receive({ type: "committed", user_turn: true, text: "Πώς πάει η αποστολή; [laughter]" });
+      for (let i = 0; i < 40; i++) await Promise.resolve();
+      expect(h.delegateVoiceIntent.mock.calls[0]![0]).toMatchObject({ query: "User: Πώς πάει η αποστολή;\n", roomId: "room:a" });
+      expect(h.inspectRoomMission).toHaveBeenCalledExactlyOnceWith("room:a");
+      expect(h.delegateVoiceIntent.mock.calls[1]![0]).toMatchObject({ query: expect.stringContaining("Tool space_plan_mission returned:") });
+      expect(json()).toEqual([
+        { type: "agent_speaking", speaking: true },
+        { type: "say", text: "Η αποστολή προχωράει.", voice: "c70cfb98867a4bfb9ae20d2401257b92" }
+      ]);
+      h.sockets[0]!.onmessage?.({ data: new Int16Array([1000, -1000]).buffer });
+      expect(h.playbackNodes).toHaveLength(1);
+      await h.receive({ type: "user_turn_taken" });
+      expect(h.playbackNodes[0].stop).toHaveBeenCalled();
+      expect(json().slice(2)).toEqual([{ type: "stop" }, { type: "agent_speaking", speaking: false }]);
+      h.sockets[0]!.onmessage?.({ data: new Int16Array([5, 5]).buffer });
+      expect(h.playbackNodes).toHaveLength(1);
+      expect(statuses).toContain("speaking");
+      expect(statuses.at(-1)).toBe("listening");
     } finally { session.close(); }
   });
 });

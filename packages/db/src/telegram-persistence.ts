@@ -1,3 +1,4 @@
+import { rollbackKeepingError } from "./rollback.js";
 import {
   TelegramIntegrationError,
   type ActivateTelegramPairingInput,
@@ -147,16 +148,17 @@ export class PostgresTelegramPersistence implements TelegramPersistence, Telegra
 
   private async withTransaction<T>(callback: (client: PgClientLike) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
+    let rollbackFailed = false;
     try {
       await client.query("BEGIN");
       const result = await callback(client);
       await client.query("COMMIT");
       return result;
     } catch (error) {
-      await client.query("ROLLBACK");
+      rollbackFailed = await rollbackKeepingError(client);
       throw error;
     } finally {
-      client.release?.();
+      client.release?.(rollbackFailed || undefined);
     }
   }
 
@@ -235,6 +237,11 @@ export class PostgresTelegramPersistence implements TelegramPersistence, Telegra
       if (!pairing) throw new TelegramIntegrationError("TELEGRAM_PAIRING_CREATE_FAILED", "Pairing session was not created.", 500);
       return { pairing, cancelledSecretVersions: cancelled.rows.map((row) => row.secretVersion) };
     });
+  }
+
+  async updateIntegrationOffset(pollingOffset: number, now: string): Promise<void> {
+    await this.pool.query("UPDATE telegram_integrations SET polling_offset = GREATEST(polling_offset, $1), updated_at = $2 WHERE id = 'global'",
+      [Math.max(0, Math.trunc(pollingOffset)), now]);
   }
 
   async updatePairingOffset(pairingId: string, pollingOffset: number, now: string): Promise<void> {

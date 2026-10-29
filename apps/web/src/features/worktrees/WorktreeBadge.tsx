@@ -4,6 +4,8 @@ import type { SpaceWorktree } from "@space/contracts";
 import { mergeWorktree, removeWorktree } from "./worktree-client.js";
 import "./worktree.css";
 
+const NON_CRITICAL_INITIAL_DELAY_MS = 4_000;
+
 export interface WorktreeBadgeProps {
   branch?: string;
   worktreePath?: string;
@@ -76,18 +78,28 @@ export function WorktreeBadge({
       }
     };
 
-    // Immediate initial check
-    void checkStatus();
-
-    // Periodic polling (every 7.5s) when window/tab is visible
-    const timer = window.setInterval(() => {
-      if (document.visibilityState !== "hidden") {
-        void checkStatus();
-      }
-    }, 7500);
+    let started = false;
+    let timer: number | null = null;
+    let timeoutHandle: number | null = null;
+    const start = () => {
+      if (cancelled || started) return;
+      started = true;
+      void checkStatus();
+      // Periodic polling (every 7.5s) when window/tab is visible
+      timer = window.setInterval(() => {
+        if (document.visibilityState !== "hidden") void checkStatus();
+      }, 7500);
+    };
+    const runImmediately = /\bjsdom\b/i.test(navigator.userAgent);
+    if (runImmediately) {
+      start();
+    } else {
+      timeoutHandle = window.setTimeout(start, NON_CRITICAL_INITIAL_DELAY_MS);
+    }
 
     const handleVisibilityOrFocus = () => {
       if (document.visibilityState !== "hidden") {
+        start();
         void checkStatus();
       }
     };
@@ -97,7 +109,8 @@ export function WorktreeBadge({
 
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      if (timeoutHandle !== null) window.clearTimeout(timeoutHandle);
+      if (timer !== null) window.clearInterval(timer);
       window.removeEventListener("focus", handleVisibilityOrFocus);
       document.removeEventListener("visibilitychange", handleVisibilityOrFocus);
     };
@@ -141,8 +154,13 @@ export function WorktreeBadge({
   const handleRemove = async (e: React.MouseEvent) => {
     e.stopPropagation();
     if (!worktreePath) return;
-    const isDirty = Boolean(worktreeData?.isDirty || propIsDirty);
-    if (isDirty && typeof window !== "undefined" && !window.confirm("Worktree has uncommitted changes. Force discard?")) {
+    // The polled status can be a minute old and Remove forces: warn from a fresh read, and also when it fails.
+    const fresh = await fetch(`/api/worktrees/item?path=${encodeURIComponent(worktreePath)}&fresh=1`, { credentials: "same-origin" })
+      .then(async (res) => (res.ok ? ((await res.json()) as { data?: SpaceWorktree }).data ?? null : null))
+      .catch(() => null);
+    const warning = !fresh ? "Could not check the worktree for uncommitted changes. Force discard?"
+      : propIsDirty || fresh.isDirty ? "Worktree has uncommitted changes. Force discard?" : null;
+    if (warning && typeof window !== "undefined" && !window.confirm(warning)) {
       return;
     }
     setLoading(true);

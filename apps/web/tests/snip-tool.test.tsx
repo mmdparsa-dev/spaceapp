@@ -286,6 +286,25 @@ describe("Snip Tool capture", () => {
     await waitFor(() => expect(navigator.clipboard.write).toHaveBeenCalledTimes(2));
   });
 
+  it("captures the full screen 3 seconds after the timer is pressed, and a second press cancels", async () => {
+    vi.useFakeTimers();
+    try {
+      render(<SnipToolOverlay isOpen onClose={vi.fn()} onCapture={vi.fn().mockResolvedValue(undefined)} />);
+      fireEvent.click(screen.getByRole("button", { name: "Capture in 3 seconds" }));
+      act(() => { vi.advanceTimersByTime(1000); });
+      fireEvent.click(screen.getByRole("button", { name: "Cancel delayed capture (2)" }));
+      act(() => { vi.advanceTimersByTime(5000); });
+      expect(captureDomFrame).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Capture in 3 seconds" }));
+      act(() => { vi.advanceTimersByTime(2000); });
+      expect(captureDomFrame).not.toHaveBeenCalled();
+      await act(async () => { vi.advanceTimersByTime(1000); });
+      expect(vi.mocked(captureDomFrame).mock.calls[0]![0].region).toEqual({ x: 0, y: 0, width: 800, height: 600 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("auto-closes after a capture only when autoCloseOnCapture is set", async () => {
     const onClose = vi.fn(), onCapture = vi.fn().mockResolvedValue(undefined);
     render(<SnipToolOverlay isOpen autoCloseOnCapture onClose={onClose} activePaneId="pane:1" onCapture={onCapture} />);
@@ -313,6 +332,90 @@ describe("Snip Tool destination", () => {
     expect(onCapture.mock.calls[0]![1]).toBe("pane:hugo");
     fireEvent.click(screen.getByRole("button", { name: "Unlock target pane (locked to Hugo)" }));
     expect(screen.getByRole("button", { name: "Snip: Finn" })).toBeTruthy();
+  });
+
+  it("Ctrl+V pastes a clipboard image into the target pane and clipboard text through the CLI's own paste", async () => {
+    const onCapture = vi.fn().mockResolvedValue(undefined);
+    const read = vi.fn().mockResolvedValue([{ types: ["image/png"], getType: vi.fn().mockResolvedValue(new Blob(["png"], { type: "image/png" })) }]);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { read } });
+    render(<SnipToolOverlay isOpen onClose={vi.fn()} availablePanes={cliPanes} activePaneId="pane:finn" activePaneMode="TERMINAL" onCapture={onCapture} />);
+    const paste = screen.getByRole("button", { name: "Paste the clipboard into Finn" });
+    fireEvent.click(paste);
+    await waitFor(() => expect(onCapture).toHaveBeenCalledOnce());
+    expect(onCapture.mock.calls[0]![0].type).toBe("image/png");
+    expect(onCapture.mock.calls[0]![1]).toBe("pane:finn");
+    expect(await screen.findByText("Pasted into Finn.")).toBeTruthy();
+    read.mockResolvedValue([{ types: ["text/plain"], getType: vi.fn() }]);
+    const action = vi.fn();
+    window.addEventListener("space:terminal-pane-action", action);
+    fireEvent.click(paste);
+    await waitFor(() => expect(action).toHaveBeenCalledOnce());
+    window.removeEventListener("space:terminal-pane-action", action);
+    expect((action.mock.calls[0]![0] as CustomEvent).detail).toEqual({ paneId: "pane:finn", action: "paste" });
+    expect(onCapture).toHaveBeenCalledOnce();
+  });
+
+  it("holds snips only in clipboard mode, and one Ctrl+V in a CLI pane pastes them all and empties the memory", async () => {
+    const onCapture = vi.fn().mockResolvedValue(undefined);
+    render(<>
+      <article data-space-pane-id="pane:hugo"><textarea aria-label="Hugo input" /></article>
+      <SnipToolOverlay isOpen onClose={vi.fn()} availablePanes={cliPanes} activePaneId="pane:finn" activePaneMode="TERMINAL" onCapture={onCapture} />
+    </>);
+    expect(screen.queryByRole("button", { name: "Hold snips" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Enable clipboard mode" }));
+    fireEvent.click(screen.getByRole("button", { name: "Hold snips" }));
+    fireEvent.click(screen.getByRole("button", { name: "Snip: Clipboard" }));
+    dragRegion([20, 20], [200, 200]);
+    expect(await screen.findByText("Held 1 snip. Ctrl+V pastes them all.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Capture full screen to clipboard" }));
+    await screen.findByRole("button", { name: "Hold snips (2 held)" });
+    expect(screen.getByRole("button", { name: "Paste 2 held snips into Finn" })).toBeTruthy();
+    expect(navigator.clipboard.write).not.toHaveBeenCalled();
+    const input = screen.getByLabelText("Hugo input");
+    // Greek layout: key is "ω", code is still KeyV.
+    expect(fireEvent.keyDown(input, { key: "ω", code: "KeyV", ctrlKey: true })).toBe(false);
+    await waitFor(() => expect(onCapture).toHaveBeenCalledTimes(2));
+    expect(onCapture.mock.calls.map(call => [call[0].type, call[1]])).toEqual([["image/png", "pane:hugo"], ["image/png", "pane:hugo"]]);
+    expect(await screen.findByText("Pasted 2 snips into Hugo.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Hold snips" }).getAttribute("aria-pressed")).toBe("true");
+    expect(fireEvent.keyDown(input, { key: "v", code: "KeyV", ctrlKey: true })).toBe(true);
+    expect(onCapture).toHaveBeenCalledTimes(2);
+  });
+
+  it("Ctrl+V with focus outside the panes pastes held snips into the snip target, but never from a text field", async () => {
+    const onCapture = vi.fn().mockResolvedValue(undefined);
+    render(<>
+      <button type="button">Plans</button><input aria-label="Composer" />
+      <SnipToolOverlay isOpen onClose={vi.fn()} defaultClipboardMode availablePanes={cliPanes} activePaneId="pane:finn" activePaneMode="TERMINAL" onCapture={onCapture} />
+    </>);
+    fireEvent.click(screen.getByRole("button", { name: "Hold snips" }));
+    fireEvent.click(screen.getByRole("button", { name: "Capture full screen to clipboard" }));
+    await screen.findByRole("button", { name: "Hold snips (1 held)" });
+    expect(fireEvent.keyDown(screen.getByLabelText("Composer"), { key: "v", code: "KeyV", ctrlKey: true })).toBe(true);
+    expect(fireEvent.keyDown(screen.getByRole("button", { name: "Plans" }), { key: "v", code: "KeyV", ctrlKey: true })).toBe(false);
+    await waitFor(() => expect(onCapture).toHaveBeenCalledOnce());
+    expect(onCapture.mock.calls[0]![1]).toBe("pane:finn");
+    expect(await screen.findByText("Pasted 1 snip into Finn.")).toBeTruthy();
+  });
+
+  it("a paste asked for while a timed snip counts down waits for it, so the last snip is never left out", async () => {
+    const onCapture = vi.fn().mockResolvedValue(undefined);
+    render(<SnipToolOverlay isOpen onClose={vi.fn()} defaultClipboardMode availablePanes={cliPanes} activePaneId="pane:finn" activePaneMode="TERMINAL" onCapture={onCapture} />);
+    fireEvent.click(screen.getByRole("button", { name: "Hold snips" }));
+    fireEvent.click(screen.getByRole("button", { name: "Capture full screen to clipboard" }));
+    await screen.findByRole("button", { name: "Hold snips (1 held)" });
+    vi.useFakeTimers();
+    try {
+      fireEvent.click(screen.getByRole("button", { name: "Capture in 3 seconds" }));
+      expect(fireEvent.keyDown(document.body, { key: "v", code: "KeyV", ctrlKey: true })).toBe(false);
+      expect(onCapture).not.toHaveBeenCalled();
+      await act(async () => { vi.advanceTimersByTime(3000); });
+    } finally {
+      vi.useRealTimers();
+    }
+    await waitFor(() => expect(onCapture).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("Pasted 2 snips into Finn.")).toBeTruthy();
   });
 
   it("releases the lock when the locked pane closes", () => {

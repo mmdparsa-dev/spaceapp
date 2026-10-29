@@ -12,6 +12,9 @@ const DISMISSED_STORAGE_WARNING_STORAGE_KEY = "space.dismissedStorageWarning";
 export type LiveDebugTone = "info" | "success" | "error";
 export interface LiveDebugToast { id: number; message: string; type: LiveDebugTone }
 export interface WatchdogAlert { id: string; message: string; timestamp: string }
+// One banner per message: a room that keeps timing out shows its newest alert, not a growing stack.
+const withWatchdogAlert = (current: WatchdogAlert[], alert: WatchdogAlert) =>
+  current.some((item) => item.id === alert.id) ? current : [...current.filter((item) => item.message !== alert.message), alert];
 
 export interface AppNotices {
   liveDebugToast: LiveDebugToast | null;
@@ -44,12 +47,18 @@ export function useAppNotices(): AppNotices {
 
   const showLiveDebug = useCallback((message: string, type: LiveDebugTone = "info") => {
     console.log(`[AI-Live-Debug][${type.toUpperCase()}] ${message}`);
+    // Progress notes ("button tapped", "pane opened") stay in the console; only failures reach the screen.
+    if (type !== "error") return;
     if (liveDebugTimerRef.current !== null) window.clearTimeout(liveDebugTimerRef.current);
     setLiveDebugToast({ id: Date.now(), message, type });
     liveDebugTimerRef.current = window.setTimeout(() => {
       setLiveDebugToast(null);
       liveDebugTimerRef.current = null;
     }, 4500);
+  }, []);
+  // The toast's timer must not outlive the app: it set state on a torn-down tree (1.1.7 public CI, smoke test).
+  useEffect(() => () => {
+    if (liveDebugTimerRef.current !== null) window.clearTimeout(liveDebugTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -75,10 +84,7 @@ export function useAppNotices(): AppNotices {
       const detail = (customEvent as CustomEvent<{ id?: string; message: string; timestamp?: string }>).detail;
       if (!detail?.message) return;
       const id = detail.id ?? `watchdog-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      setWatchdogAlerts((current) => {
-        if (current.some((item) => item.id === id)) return current;
-        return [...current, { id, message: detail.message, timestamp: detail.timestamp ?? new Date().toISOString() }];
-      });
+      setWatchdogAlerts((current) => withWatchdogAlert(current, { id, message: detail.message, timestamp: detail.timestamp ?? new Date().toISOString() }));
     };
     window.addEventListener("space:room-watchdog-alert", handleWatchdogCustomEvent as EventListener);
     return () => {
@@ -152,10 +158,7 @@ export function useAppNotices(): AppNotices {
     dismissLiveDebugToast: () => setLiveDebugToast(null),
     showLiveDebug,
     watchdogAlerts,
-    addWatchdogAlert: (alert) => setWatchdogAlerts((current) => {
-      if (current.some((item) => item.id === alert.id)) return current;
-      return [...current, alert];
-    }),
+    addWatchdogAlert: (alert) => setWatchdogAlerts((current) => withWatchdogAlert(current, alert)),
     dismissWatchdogAlert: (id) => setWatchdogAlerts((current) => current.filter((item) => item.id !== id)),
     clipboardNotice,
     setClipboardNotice,

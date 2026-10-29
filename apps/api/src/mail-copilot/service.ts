@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import {
   MAIL_SYSTEM_LABELS, mailRuleMatches, mailSubjectKey, mailSubjectKeyPattern, mailThreadActionLabels, resolveMailCopilotPaneMetadata, type ConnectorCapability, type MailActionRecord, type MailOperatorAction, type MailRule, type MailRuleDecision, type MailRuleProposal, type MailRuleSubject, type MailAccountSummary, type MailComposeInput, type MailCopilotEvent,
   type MailCopilotEventInput, type MailCopilotEventType, type MailCopilotMemory, type MailCopilotMemoryCreate, type MailCopilotMemoryQuery, type MailCopilotMemoryUpdate,
-  type MailCopilotPaneMetadata, type MailCopilotPendingItem, type MailHabitLevel, type MailHabits, type MailHabitSender, type MailCopilotReviewDecision, type MailCopilotRun, type MailCopilotRunView, type MailLabel,
+  type MailActionLogEntry, type MailCopilotFixRequest, type MailFixRequestView, type MailCopilotPaneMetadata, type MailCopilotPendingItem, type MailHabitLevel, type MailHabits, type MailHabitSender, type MailCopilotReviewDecision, type MailCopilotRun, type MailCopilotRunView, type MailLabel,
   type MailMessage, type MailThread, type MailThreadAction, type MailThreadSummary, type MailThreadsPage, type MailThreadsQuery, type Pane
 } from "@space/contracts";
 import type { MailCopilotRepository } from "@space/db";
@@ -10,9 +10,11 @@ import { SpaceConflictError, SpaceNotFoundError } from "@space/runtime";
 import { GmailMailboxError } from "../job-apply/gmail-mailbox.js";
 import { createGmailClient, mapLimited, type GmailClient, type GmailJson } from "./gmail-client.js";
 import { classifyThreadChange, netThreadChanges, type GmailHistoryEntry } from "./history.js";
+import type { MailCopilotKickoff } from "./kickoff.js";
 import { buildMime, header, parseParticipants, parsePayload } from "./gmail-mime.js";
 import { sanitizeMailHtml } from "./html-sanitizer.js";
 import { decodeEntities } from "../job-apply/gmail-mailbox.js";
+import { mailCopilotNoticeKey } from "./notify.js";
 
 /** The owner's Google connector: every account allowed for Space and an access token per capability. */
 export interface MailCopilotGoogleAccess {
@@ -28,6 +30,10 @@ export interface MailCopilotServiceOptions {
   repository: MailCopilotRepository;
   /** Every activity event, for the room stream and notifications. */
   onEvent?(event: MailCopilotEvent): void;
+  /** Closes a Space notification by its dedupe key (a NEEDS_USER mail the operator handled no longer needs them). */
+  resolveNotice?(owner: string, dedupeKey: string): Promise<unknown>;
+  /** Starts a run for new work nobody pressed Start for (a mail sent to the copilot to fix). */
+  kickoff?: MailCopilotKickoff;
   now?(): string;
 }
 
@@ -36,8 +42,14 @@ const NEXT_POLL_MS = 2_000;
 const NEXT_MAX_WAIT_MS = 120_000;
 /** A TAKEN item nobody reported for this long goes back to the queue (a crashed CLI). */
 const TAKEN_STALE_MS = 30 * 60_000;
+/** A RUNNING run with no activity this long, whose CLI sits at an empty prompt, lost its agent: it gets its kickoff again. */
+const RUN_IDLE_MS = 10 * 60_000;
 /** The backlog scan looks at this many newest inbox conversations per account. */
 const BACKLOG_SCAN_LIMIT = 25;
+/** shortcut: the daily whole-inbox scan stops after this many conversations per account; page on across days if inboxes grow larger. */
+const DAILY_SCAN_LIMIT = 1000;
+/** A thread with one of these was decided once; SKIPPED is undecided and comes back in the next daily run. */
+const DECIDED_TYPES: MailCopilotEventType[] = ["TRIAGED", "REPLIED", "DRAFTED", "ARCHIVED", "TRASHED", "LABELED", "NEEDS_USER", "FIXED"];
 /** Senders a copilot never answers on its own. */
 const AUTOMATED_SENDER = /(^|[.<@-])(no-?reply|do-?not-?reply|noreply|notifications?|newsletter|mailer-daemon|postmaster|bounce)([.>@-]|$)/i;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -71,7 +83,7 @@ const HABIT_WINDOW_MS = 180 * 24 * 3_600_000;
 const DISPOSITIONS: ReadonlySet<MailOperatorAction> = new Set(["ARCHIVE", "TRASH", "MOVE", "LABEL", "SPAM"]);
 const HABIT_VERB: Record<MailOperatorAction, string> = {
   ARCHIVE: "archived", UNARCHIVE: "moved back to the inbox", TRASH: "trashed", UNTRASH: "restored from trash", DELETE: "deleted for good", MOVE: "moved to", LABEL: "labeled", UNLABEL: "removed the label",
-  STAR: "starred", UNSTAR: "unstarred", SPAM: "reported as spam", NOT_SPAM: "marked not spam", REPLY: "replied to", FORWARD: "forwarded"
+  STAR: "starred", UNSTAR: "unstarred", SPAM: "reported as spam", NOT_SPAM: "marked not spam", REPLY: "replied to", FORWARD: "forwarded", FIX: "sent to the copilot to fix"
 };
 /** A rule is learned from at least this many observed operator actions of one kind on one sender, this consistent, in this window. */
 const LEARN_MIN_ACTIONS = 3;
@@ -80,9 +92,11 @@ const LEARN_WINDOW_MS = 90 * 24 * 3_600_000;
 /** shortcut: at most this many learned rules per account and day (a bulk clean-up would otherwise make dozens); raise it if the operator wants faster learning. */
 const LEARN_MAX_PER_DAY = 10;
 /** What the server may learn a rule for: where mail goes, reversibly; never a reply, a send or a permanent deletion (a star needs no rule). */
-const LEARNABLE: Partial<Record<MailOperatorAction, "ARCHIVE" | "MOVE" | "LABEL" | "TRASH">> = { ARCHIVE: "ARCHIVE", MOVE: "MOVE", LABEL: "LABEL", TRASH: "TRASH" };
+const LEARNABLE: Partial<Record<MailOperatorAction, "ARCHIVE" | "MOVE" | "LABEL" | "TRASH" | "FIX">> = { ARCHIVE: "ARCHIVE", MOVE: "MOVE", LABEL: "LABEL", TRASH: "TRASH", FIX: "FIX" };
 /** The operator's action that takes a rule's action back: it counts against the rule. */
 const REVERSES: Partial<Record<MailOperatorAction, MailOperatorAction[]>> = { UNARCHIVE: ["ARCHIVE", "MOVE"], UNTRASH: ["TRASH"], UNLABEL: ["LABEL", "MOVE"] };
+/** The operator's actions that settle a conversation: its waiting triage items close. */
+const HANDLES_MAIL: ReadonlySet<MailOperatorAction> = new Set(["ARCHIVE", "TRASH", "DELETE", "MOVE", "SPAM", "REPLY", "FORWARD", "FIX"]);
 /** The action log keeps a year. */
 const ACTION_RETENTION_MS = 365 * 24 * 3_600_000;
 
@@ -99,6 +113,13 @@ function accessOf(capabilities: readonly ConnectorCapability[]): MailAccountSumm
 function gmailError(account: string, error: unknown): Error {
   if (error instanceof GmailMailboxError) return new SpaceConflictError(`${account}: ${error.message}`);
   return error instanceof Error ? error : new Error(String(error));
+}
+/** As Gmail answers: a reply goes from the "Send mail as" address the mail was sent to, anything else from the default one; the account itself when Gmail lists none. */
+async function senderFor(client: GmailClient, account: string, headers: unknown): Promise<{ from: string; fromName?: string }> {
+  const aliases = await client.sendAs().catch(() => []);
+  const recipients = new Set(parseParticipants([header(headers, "To"), header(headers, "Cc")].filter(Boolean).join(", ")).map((entry) => entry.address));
+  const alias = aliases.find((entry) => recipients.has(entry.email)) ?? aliases.find((entry) => entry.isDefault);
+  return alias ? { from: alias.email, fromName: alias.name } : { from: account };
 }
 function iso(internalDate: unknown): string | null {
   const ms = Number(internalDate);
@@ -127,6 +148,8 @@ export function habitWords(level: MailHabitLevel, limit = 4): string {
     return `${HABIT_VERB[entry.action]}${target} ${counted}${inferred}`.replace(/\s+/g, " ").trim();
   }).join("; ");
 }
+/** How many of a sender's actions the operator was seen doing (in the pane or in Gmail), as opposed to inferred. */
+const observedOf = (habit: MailHabitSender) => habit.level.actions.reduce((sum, entry) => sum + entry.observed, 0);
 /** Groups action rows into one habit level: per action and labels, observed and inferred counts, share of the decisions, last time. */
 function habitLevel(kind: MailHabitLevel["level"], key: string, rows: readonly MailActionRecord[], names: ReadonlyMap<string, string>): MailHabitLevel | null {
   if (!rows.length) return null;
@@ -148,6 +171,8 @@ function habitLevel(kind: MailHabitLevel["level"], key: string, rows: readonly M
 export function createMailCopilotService(options: MailCopilotServiceOptions) {
   const now = options.now ?? (() => new Date().toISOString());
   const { repository } = options;
+  const starting = new Map<string, Promise<boolean>>();
+  const deciding = new Map<string, Promise<{ decision: MailCopilotReviewDecision["decision"]; sent: { messageId: string; threadId: string } | null }>>();
 
   async function record(owner: string, input: MailCopilotEventInput & MailEventContext & { type: MailCopilotEventType; status?: "PENDING" | "TAKEN" | "DONE" | null }): Promise<MailCopilotEvent> {
     const event = await repository.createEvent({
@@ -225,13 +250,14 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
     };
   }
 
-  const RULE_ACTION_FOR: Record<string, MailRule["action"]["type"]> = { send: "REPLY", archive: "ARCHIVE", label: "LABEL", move: "MOVE", trash: "TRASH", star: "STAR", read: "MARK_READ" };
+  const RULE_ACTION_FOR: Record<string, MailRule["action"]["type"]> = { send: "REPLY" };
   /**
-   * ASSIST: the agent drafts and asks. RULES: only under an approved rule of the owner that names this action and
-   * matches the message (the rule's use is recorded). FULL: on its own judgement.
+   * The gate on what the copilot sends (organizing is never gated). ASSIST: the agent drafts and asks. RULES: only
+   * under an approved rule of the owner that names this action and matches the message (the rule's use is recorded).
+   * FULL: on its own judgement.
    */
   type GateContext = { paneId: string | null; accountEmail: string | null; threadId: string | null; messageId?: string | null };
-  async function authorize(owner: string, pane: Pane | null, action: string, ruleId: string | undefined, subject: () => Promise<MailRuleSubject | null>, context: GateContext, labelIds: readonly string[] = []): Promise<void> {
+  async function authorize(owner: string, pane: Pane | null, action: string, ruleId: string | undefined, subject: () => Promise<MailRuleSubject | null>, context: GateContext): Promise<void> {
     const autonomy = paneSettings(pane).autonomy;
     if (autonomy === "FULL") return;
     if (autonomy === "ASSIST") throw new SpaceConflictError(`MAIL_NEEDS_REVIEW: autonomy is Assist, so the copilot cannot ${action} on its own; ask with space_mail_review_request.`);
@@ -240,9 +266,6 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
     if (!rule || rule.status !== "APPROVED") throw new SpaceConflictError(`MAIL_NEEDS_REVIEW: rule ${ruleId} is not an approved rule of the operator.`);
     if (rule.accountEmail && context.accountEmail && rule.accountEmail !== context.accountEmail) throw new SpaceConflictError(`MAIL_NEEDS_REVIEW: rule "${rule.name}" belongs to ${rule.accountEmail}.`);
     if (rule.action.type !== RULE_ACTION_FOR[action]) throw new SpaceConflictError(`MAIL_NEEDS_REVIEW: rule "${rule.name}" allows ${rule.action.type}, not ${action}.`);
-    if ((rule.action.type === "LABEL" || rule.action.type === "MOVE") && (!labelIds.length || !labelIds.every((label) => rule.action.labels?.includes(label)))) {
-      throw new SpaceConflictError(`MAIL_NEEDS_REVIEW: rule "${rule.name}" allows only the labels ${(rule.action.labels ?? []).join(", ") || "(none named)"}.`);
-    }
     const facts = await subject();
     if (!facts || !mailRuleMatches(rule.condition, facts)) throw new SpaceConflictError(`MAIL_NEEDS_REVIEW: rule "${rule.name}" does not match this message; ask with space_mail_review_request.`);
     await repository.updateRule(owner, rule.id, { appliedCount: rule.appliedCount + 1, lastAppliedAt: now() });
@@ -290,6 +313,8 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
         const received = known ? null : (await repository.listEvents(owner, { accountEmail: email, threadId: change.threadId, types: ["MAIL_RECEIVED"], limit: 1 }))[0];
         const from = known?.fromAddress ?? String((received?.payload.from as { address?: string } | undefined)?.address ?? "");
         facts = from || known?.subject || received ? { from, subject: known?.subject ?? String(received?.payload.subject ?? ""), labelIds: [], hasAttachment: false } : null;
+        // A deleted message Space never saw (a draft, mail older than the log) says nothing about the operator's habits.
+        if (!facts) return 0;
       } else {
         messages = await client.thread(change.threadId, "metadata").then((thread) => (thread.messages as GmailJson[] | undefined) ?? [], () => []);
         const message = correspondent(messages, email);
@@ -312,6 +337,7 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
         if (!row) continue;
         count += 1;
         await learnRules(owner, row, paneId).catch(() => undefined);
+        if (HANDLES_MAIL.has(row.action)) await closeHandledItems(owner, email, change.threadId).catch(() => undefined);
       }
       return count;
     });
@@ -395,6 +421,12 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
     const sameLabels = (left: readonly string[], right: readonly string[]) => left.length === right.length && left.every((label) => right.includes(label));
     /** How consistently the rows in scope do `type` (with these labels): matches over the decisions of that kind, reversals counting against. */
     const consistency = (scope: MailActionRecord[], type: string, labels: readonly string[]) => {
+      // A hand-off to the copilot comes on top of where the mail went: counted over the conversations the operator handled.
+      if (type === "FIX") {
+        const threads = new Set(scope.map((entry) => entry.threadId));
+        const fixed = new Set(scope.filter((entry) => entry.action === "FIX").map((entry) => entry.threadId));
+        return { matches: fixed.size, decisions: threads.size, share: threads.size ? fixed.size / threads.size : 0 };
+      }
       const matches = scope.filter((entry) => LEARNABLE[entry.action] === type && sameLabels(entry.labelIds, labels)).length;
       const against = scope.filter((entry) => (REVERSES[entry.action] ?? []).includes(type as MailOperatorAction)).length;
       const decisions = scope.filter((entry) => DISPOSITIONS.has(entry.action)).length + against;
@@ -403,7 +435,8 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
     const facts = (entry: MailActionRecord): MailRuleSubject => ({ from: entry.fromAddress ?? "", subject: entry.subject ?? "", labelIds: [], hasAttachment: false });
     // Contradictions: a reversal of what a learned rule just did, or a habit that is no longer consistent.
     const lastAgent = REVERSES[row.action] ? (await repository.listActions(owner, { accountEmail: row.accountEmail, threadId: row.threadId, actors: ["AGENT"], limit: 1 }))[0] : undefined;
-    for (const rule of rules.filter((entry) => entry.status === "APPROVED" && entry.proposedBy === "LEARNED" && entry.condition.fromAddress === row.fromAddress)) {
+    // A FIX rule's mail is handled by the copilot afterwards, so the operator's later actions on it are no contradiction; the Rules tab retires it.
+    for (const rule of rules.filter((entry) => entry.status === "APPROVED" && entry.proposedBy === "LEARNED" && entry.action.type !== "FIX" && entry.condition.fromAddress === row.fromAddress)) {
       const scope = rows.filter((entry) => mailRuleMatches(rule.condition, facts(entry)));
       const taken = Boolean(lastAgent?.ruleId === rule.id && (REVERSES[row.action] ?? []).includes(lastAgent.action));
       const { share } = consistency(scope, rule.action.type, rule.action.labels ?? []);
@@ -431,12 +464,46 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
     if (today.length >= LEARN_MAX_PER_DAY) return;
     const stats = consistency(chosen.scope, type, row.labelIds);
     const labelNames = action.labels?.length ? await clientFor(owner, row.accountEmail).then((client) => client.labels()).then((labels) => action.labels!.map((id) => labels.find((label) => label.id === id)?.name ?? id), () => action.labels!) : [];
-    const what = type === "MOVE" ? `Move to ${labelNames.join(", ")}` : type === "LABEL" ? `Label ${labelNames.join(", ")}` : type === "ARCHIVE" ? "Archive" : "Trash";
+    const what = type === "MOVE" ? `Move to ${labelNames.join(", ")}` : type === "LABEL" ? `Label ${labelNames.join(", ")}` : type === "ARCHIVE" ? "Archive" : type === "FIX" ? "Send to the copilot to fix" : "Trash";
     const about = chosen.condition.subjectPattern ? ` about "${row.subject?.slice(0, 80) ?? row.subjectKey}"` : "";
     const rule = await repository.createRule({ ownerUserId: owner, accountEmail: row.accountEmail, name: `${what} mail from ${row.fromAddress}${about}`.slice(0, 200), condition: chosen.condition, action, status: "APPROVED",
       confidence: Math.round(stats.share * 100) / 100, proposedBy: "LEARNED",
       evidence: [`You did this ${stats.matches} of ${stats.decisions} times on ${row.accountEmail} in the last 90 days`, ...chosen.scope.filter((entry) => LEARNABLE[entry.action] === type).slice(0, 3).map((entry) => `${entry.occurredAt.slice(0, 10)}: ${entry.subject ?? "(no subject)"} (${entry.source === "GMAIL" ? "in Gmail" : "in the pane"})`.slice(0, 300))] });
     await record(owner, { paneId, type: "RULE_LEARNED", accountEmail: rule.accountEmail, threadId: row.threadId, message: `Rule learned from your actions: ${rule.name}`, payload: { ruleId: rule.id, name: rule.name, condition: rule.condition, action: rule.action } });
+  }
+  /**
+   * A conversation the operator already handled (or handed to the copilot to fix) needs no triage: its waiting
+   * MAIL_RECEIVED and TRIAGE items close, so the copilot does not spend a turn on mail that is already done.
+   */
+  async function closeHandledItems(owner: string, account: string, threadId: string): Promise<void> {
+    const waiting = await repository.listEvents(owner, { accountEmail: account, threadId, types: ["MAIL_RECEIVED", "TRIAGE"], status: ["PENDING"], limit: 20 });
+    for (const item of waiting) await repository.setItemStatus(owner, item.id, "DONE");
+    // Needs you as questions (plan clipboard:5AQvaoSR-IZa): a mail the copilot left to the operator stops asking once they handled it.
+    if (options.resolveNotice) for (const asked of await repository.listEvents(owner, { accountEmail: account, threadId, types: ["NEEDS_USER"], limit: 20 })) {
+      await options.resolveNotice(owner, mailCopilotNoticeKey(asked.id));
+    }
+  }
+  /** The copilot's questions about a hand-off (same conversation, or asked while it was being worked on) with the operator's answers. */
+  function exchangesFor(request: MailCopilotEvent, until: string | null, questions: MailCopilotEvent[], answers: MailCopilotEvent[]): MailFixRequestView["exchanges"] {
+    return questions.filter((question) => question.createdAt >= request.createdAt && (!until || question.createdAt <= until)
+      && (question.threadId ? question.threadId === request.threadId : question.paneId === request.paneId))
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .map((question) => {
+        const answer = answers.find((entry) => entry.payload.questionId === question.payload.questionId);
+        return { question: String(question.payload.question ?? question.message), askedAt: question.createdAt, answer: answer ? String(answer.payload.answer ?? "") : null, answeredAt: answer?.createdAt ?? null };
+      });
+  }
+  /** A LESSON memory per sender and kind of mail (the latest fix wins): what the operator asked, what they decided, what fixed it. */
+  async function rememberFix(owner: string, item: MailCopilotEvent, summary: string): Promise<MailCopilotMemory> {
+    const from = item.payload.from as { address?: string; name?: string } | null | undefined;
+    const address = from?.address?.toLowerCase() || null;
+    const subject = String(item.payload.subject ?? "");
+    const [questions, answers] = await Promise.all([repository.listEvents(owner, { types: ["QUESTION"], since: item.createdAt, limit: 100 }), repository.listEvents(owner, { types: ["ANSWERED"], since: item.createdAt, limit: 100 })]);
+    const decided = exchangesFor(item, null, questions, answers).filter((entry) => entry.answer).map((entry) => `asked "${entry.question.slice(0, 300)}", the operator answered "${entry.answer!.slice(0, 300)}"`);
+    const text = [`"${subject}"${address ? ` from ${address}` : ""} was sent to the copilot to fix${item.payload.note ? ` with the request "${String(item.payload.note).slice(0, 400)}"` : ""}.`,
+      decided.length ? `The copilot ${decided.join("; ")}.` : "", `What fixed it: ${summary}`].filter(Boolean).join(" ").slice(0, 4000);
+    return repository.upsertMemory({ ownerUserId: owner, kind: "LESSON", key: `fix: ${mailSubjectKey(subject) || subject.slice(0, 200)}`.slice(0, 300), text, contactEmail: address, domain: address ? senderDomain(address) || null : null,
+      accountEmail: item.accountEmail, tags: ["fix"], source: "LEARNED", confidence: 0.8, pinned: false });
   }
   /** Label names (the unified view's ids) become this account's label ids. */
   async function resolveLabelIds(client: GmailClient, ids: string[]): Promise<string[]> {
@@ -525,23 +592,20 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
       return { account: email!, threadId, subject: messages[0]!.subject, messages };
     },
     /**
-     * Archive, trash, star, read, labels and a move to a label on a whole thread (full access). The agent is held to
-     * the pane's autonomy. Everything but read marks lands in the account's action log, which the copilot learns from.
+     * Archive, trash, star, read, labels and a move to a label on a whole thread (full access). Organizing is the
+     * copilot's own job at every autonomy (operator 2026-10-27; only sending is gated). Everything but read marks lands
+     * in the account's action log (actor AGENT for the copilot), which the copilot learns from.
      */
     async modify(owner: string, pane: Pane | null, threadId: string, rawInput: MailThreadAction, by: "operator" | "agent" = "operator", ruleId?: string): Promise<void> {
       await mailAccounts(owner, pane, rawInput.account);
       const client = await clientFor(owner, rawInput.account, "MAIL_ORGANIZE");
       const input: MailThreadAction = rawInput.labelIds?.length ? { ...rawInput, labelIds: await resolveLabelIds(client, rawInput.labelIds).catch((error) => { throw gmailError(rawInput.account, error); }) } : rawInput;
-      const context = { paneId: pane?.id ?? null, accountEmail: input.account, threadId };
       const logged = LOGGED_ACTION[input.action];
       let facts: Promise<MailRuleSubject | null> | null = null;
       const subject = () => facts ??= client.thread(threadId, "metadata").then((thread) => {
         const message = correspondent((thread.messages as GmailJson[] | undefined) ?? [], input.account);
         return message ? ruleSubject(message) : null;
       }, (error: unknown) => { throw gmailError(input.account, error); });
-      if (by === "agent" && input.action !== "read" && input.action !== "unread" && input.action !== "star" && input.action !== "unstar") {
-        await authorize(owner, pane, input.action, ruleId, subject, context, input.labelIds);
-      }
       try {
         if (input.action === "trash" || input.action === "untrash") await client.trashThread(threadId, input.action === "untrash");
         else {
@@ -565,6 +629,7 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
       }
       const row = await logAction(owner, { accountEmail: input.account, threadId, action: logged, labelIds: input.labelIds, facts: await subject().catch(() => null), actor: by === "agent" ? "AGENT" : "OPERATOR", source: "PANE", ruleId });
       if (row) await learnRules(owner, row, pane?.id ?? null).catch(() => undefined);
+      if (by === "operator" && HANDLES_MAIL.has(logged)) await closeHandledItems(owner, input.account, threadId).catch(() => undefined);
     },
     /** Sends a new message, a reply or a forward from one of the pane's accounts; replies carry the threading headers. The agent is held to the pane's autonomy and the hourly cap. */
     async send(owner: string, pane: Pane | null, input: MailComposeInput, by: "operator" | "agent" | "review" = "operator", ruleId?: string): Promise<{ messageId: string; threadId: string }> {
@@ -581,7 +646,8 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
       const headers = (original?.payload as { headers?: unknown } | undefined)?.headers;
       const inReplyTo = header(headers, "Message-ID") || null;
       const references = header(headers, "References") || null;
-      const raw = buildMime({ from: input.account, to: input.to, cc: input.cc, bcc: input.bcc, subject: input.subject, text: input.text, inReplyTo, references });
+      const sender = await senderFor(client, input.account, headers);
+      const raw = buildMime({ ...sender, to: input.to, cc: input.cc, bcc: input.bcc, subject: input.subject, text: input.text, inReplyTo, references });
       let sent: { id: string; threadId: string };
       try {
         sent = await client.send(raw, input.threadId);
@@ -589,11 +655,12 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
         throw gmailError(input.account, error);
       }
       await record(owner, { paneId: pane?.id ?? null, type: "SENT", accountEmail: input.account, threadId: sent.threadId, messageId: sent.id,
-        message: `${by === "agent" ? "The copilot sent" : "You sent"}: ${input.subject || "(no subject)"} → ${input.to.join(", ")}`, payload: { by, to: input.to, cc: input.cc, reply: Boolean(input.inReplyToMessageId) } });
+        message: `${by === "agent" ? "The copilot sent" : "You sent"}: ${input.subject || "(no subject)"} → ${input.to.join(", ")}`, payload: { by, from: sender.from, to: input.to, cc: input.cc, reply: Boolean(input.inReplyToMessageId) } });
       // Replies and forwards join the action log (a forward names no correspondent: the forwarded mail is in its body).
       const kind: MailOperatorAction | null = /^\s*fwd?\s*:/i.test(input.subject) ? "FORWARD" : original ? "REPLY" : null;
       if (kind) await logAction(owner, { accountEmail: input.account, threadId: sent.threadId, messageId: sent.id, action: kind, facts: original ? ruleSubject(original) : { from: "", subject: input.subject },
         actor: by === "agent" ? "AGENT" : "OPERATOR", source: "PANE", ruleId });
+      if (kind === "REPLY" && by !== "agent") await closeHandledItems(owner, input.account, sent.threadId).catch(() => undefined);
       // A reply the operator wrote themselves teaches the copilot how they answer: a learn item for the next run.
       if (by === "operator" && pane && original) {
         await record(owner, { paneId: pane.id, type: "USER_ACTION", status: "PENDING", accountEmail: input.account, threadId: sent.threadId, messageId: input.inReplyToMessageId ?? null,
@@ -605,13 +672,45 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
     async draft(owner: string, pane: Pane | null, input: MailComposeInput): Promise<{ draftId: string; messageId: string }> {
       await mailAccounts(owner, pane, input.account);
       const client = await clientFor(owner, input.account, "MAIL_ORGANIZE");
-      const raw = buildMime({ from: input.account, to: input.to, cc: input.cc, bcc: input.bcc, subject: input.subject, text: input.text });
+      // A reply draft carries the threading headers too, or Gmail starts a new thread despite the threadId.
+      const original = input.inReplyToMessageId ? await client.message(input.inReplyToMessageId, "metadata").catch((error) => { throw gmailError(input.account, error); }) : null;
+      const headers = (original?.payload as { headers?: unknown } | undefined)?.headers;
+      const raw = buildMime({ ...await senderFor(client, input.account, headers), to: input.to, cc: input.cc, bcc: input.bcc, subject: input.subject, text: input.text,
+        inReplyTo: header(headers, "Message-ID") || null, references: header(headers, "References") || null });
       try {
         const draft = await client.createDraft(raw, input.threadId);
         return { draftId: draft.id, messageId: draft.messageId };
       } catch (error) {
         throw gmailError(input.account, error);
       }
+    },
+    /** Deletes a draft the copilot saved itself (its DRAFTED event names it) and nobody changed since; every other draft is the operator's. */
+    async deleteDraft(owner: string, pane: Pane, account: string, draftId: string): Promise<void> {
+      await mailAccounts(owner, pane, account);
+      // shortcut: only the newest 500 copilot drafts of the account are found; page the events if older ones must go.
+      const drafted = (await repository.listEvents(owner, { accountEmail: account, types: ["DRAFTED"], limit: 500 })).find((event) => event.payload.draftId === draftId);
+      if (!drafted) throw new SpaceConflictError("The copilot did not save that draft; only the operator deletes it.");
+      const client = await clientFor(owner, account, "MAIL_ORGANIZE");
+      const current = await client.draftMessageId(draftId).catch((error) => { throw gmailError(account, error); });
+      // Drafts saved before 2026-10-26 carry no message id: those are deleted as saved.
+      if (typeof drafted.payload.draftMessageId === "string" && current !== drafted.payload.draftMessageId) throw new SpaceConflictError("That draft changed after the copilot saved it (the operator may have edited it); only the operator deletes it now.");
+      await client.deleteDraft(draftId).catch((error) => { throw gmailError(account, error); });
+      await record(owner, { paneId: pane.id, type: "NOTE", accountEmail: account, threadId: drafted.threadId, message: `The copilot deleted its draft: ${drafted.message.replace(/^The copilot drafted: /, "")}`, payload: { draftId, deleted: true } });
+    },
+    /** Gmail's Delete for any mail or draft, allowed at every autonomy (operator decision 2026-10-26): a message goes to the Trash (30 days), a draft is discarded. */
+    async deleteMail(owner: string, pane: Pane, input: { account: string; messageId?: string; draftId?: string }): Promise<void> {
+      await mailAccounts(owner, pane, input.account);
+      const client = await clientFor(owner, input.account, "MAIL_ORGANIZE");
+      if (input.draftId) {
+        await client.deleteDraft(input.draftId).catch((error) => { throw gmailError(input.account, error); });
+        await record(owner, { paneId: pane.id, type: "NOTE", accountEmail: input.account, message: "The copilot discarded a draft", payload: { draftId: input.draftId, deleted: true } });
+        return;
+      }
+      const message = await client.message(input.messageId!, "metadata").catch((error) => { throw gmailError(input.account, error); });
+      await client.trashMessage(input.messageId!).catch((error) => { throw gmailError(input.account, error); });
+      const facts = ruleSubject(message);
+      await record(owner, { paneId: pane.id, type: "TRASHED", accountEmail: input.account, threadId: String(message.threadId ?? "") || null, messageId: input.messageId!,
+        message: `The copilot deleted: ${facts.subject || "(no subject)"} from ${facts.from || "?"}`, payload: { action: "delete", from: facts.from, subject: facts.subject } });
     },
     /** One attachment's bytes and type, for download or inline display. */
     async attachment(owner: string, pane: Pane | null, account: string, messageId: string, attachmentId: string): Promise<{ data: Buffer; filename: string; mimeType: string }> {
@@ -667,7 +766,7 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
       await record(owner, { paneId, runId: run.id, type: "RUN_STARTED", message: "Run started: the copilot works through new mail and the backlog" });
       return { run, kickoff: true, resumed: false };
     },
-    async markKickoff(owner: string, runId: string): Promise<void> { await repository.updateRun(owner, runId, { kickoffSentAt: now() }); },
+    async markKickoff(owner: string, runId: string): Promise<void> { await repository.updateRun(owner, runId, { kickoffSentAt: now(), lastActivityAt: now() }); },
     async pauseRun(owner: string, paneId: string): Promise<MailCopilotRun> {
       const run = await repository.getActiveRun(paneId);
       if (!run || run.ownerUserId !== owner) throw new SpaceConflictError("No run is active in this pane.");
@@ -717,15 +816,34 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
         await sleep(Math.min(NEXT_POLL_MS, Math.max(0, deadline - Date.now())));
       }
     },
-    /** Untriaged inbox conversations of the pane's accounts within the backlog window become TRIAGE items, once per thread. */
-    async scanBacklog(owner: string, pane: Pane, runId: string | null): Promise<number> {
+    /**
+     * Untriaged inbox conversations of the pane's accounts within the backlog window become TRIAGE items, once per thread.
+     * The daily run's scan (`wholeInbox`) takes every inbox conversation, automated senders included, that no item decided
+     * yet and none waits for.
+     */
+    async scanBacklog(owner: string, pane: Pane, runId: string | null, wholeInbox = false): Promise<number> {
       const settings = paneSettings(pane);
       const since = Date.parse(now()) - settings.backlogHours * 3_600_000;
-      const page = await this.threads(owner, pane, { account: "all", labelId: "INBOX", max: BACKLOG_SCAN_LIMIT });
+      const threads: MailThreadSummary[] = [];
+      if (!wholeInbox) threads.push(...(await this.threads(owner, pane, { account: "all", labelId: "INBOX", max: BACKLOG_SCAN_LIMIT })).threads);
+      // Per account: the unified view keeps only `max` threads of a page while every account's cursor moves on.
+      else for (const account of await mailAccounts(owner, pane, "all")) {
+        let pageToken: string | undefined;
+        let taken = 0;
+        do {
+          const page = await this.threads(owner, pane, { account, labelId: "INBOX", max: 50, ...(pageToken ? { pageToken } : {}) });
+          threads.push(...page.threads);
+          taken += page.threads.length;
+          pageToken = page.nextPageToken ?? undefined;
+        } while (pageToken && taken < DAILY_SCAN_LIMIT);
+      }
       let created = 0;
-      for (const thread of page.threads) {
-        if (!thread.receivedAt || Date.parse(thread.receivedAt) < since || AUTOMATED_SENDER.test(thread.from.address)) continue;
-        const seen = await repository.listEvents(owner, { accountEmail: thread.account, threadId: thread.threadId, types: ["TRIAGE", "MAIL_RECEIVED", "TRIAGED", "REPLIED", "DRAFTED", "ARCHIVED", "TRASHED", "LABELED", "SKIPPED", "NEEDS_USER"], limit: 1 });
+      for (const thread of threads) {
+        if (!wholeInbox && (!thread.receivedAt || Date.parse(thread.receivedAt) < since || AUTOMATED_SENDER.test(thread.from.address))) continue;
+        const seen = wholeInbox
+          ? (await repository.listEvents(owner, { accountEmail: thread.account, threadId: thread.threadId, types: ["TRIAGE", "MAIL_RECEIVED", "FIX_REQUESTED", ...DECIDED_TYPES], limit: 50 }))
+            .filter((event) => DECIDED_TYPES.includes(event.type) || event.status === "PENDING" || event.status === "TAKEN")
+          : await repository.listEvents(owner, { accountEmail: thread.account, threadId: thread.threadId, types: ["TRIAGE", "MAIL_RECEIVED", "TRIAGED", "REPLIED", "DRAFTED", "ARCHIVED", "TRASHED", "LABELED", "SKIPPED", "NEEDS_USER"], limit: 1 });
         if (seen.length) continue;
         await record(owner, { paneId: pane.id, runId, type: "TRIAGE", status: "PENDING", accountEmail: thread.account, threadId: thread.threadId, messageId: thread.messageId,
           message: `Triage: ${thread.subject || "(no subject)"} from ${thread.from.name || thread.from.address}`, payload: { from: thread.from, subject: thread.subject, snippet: thread.snippet, labelIds: thread.labelIds, receivedAt: thread.receivedAt } });
@@ -744,32 +862,39 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
       const habits = newest ? await habitsFor(owner, item.accountEmail, { from: newest.from.address, subject: newest.subject }).catch(() => null) : null;
       return { thread: thread ? { ...thread, messages: thread.messages.map((message) => ({ ...message, html: null })) } : null, memories, habits };
     },
-    async reportItem(owner: string, pane: Pane, input: { eventId: string; outcome: "replied" | "drafted" | "archived" | "labeled" | "skipped" | "needs_user" | "learned"; summary: string; memoryIds: string[] }) {
+    async reportItem(owner: string, pane: Pane, input: { eventId: string; outcome: "replied" | "drafted" | "archived" | "labeled" | "skipped" | "needs_user" | "learned" | "fixed"; summary: string; memoryIds: string[] }) {
       const item = await repository.getEvent(owner, input.eventId);
       if (!item || item.status === null) throw new SpaceNotFoundError(`Work item ${input.eventId} was not found.`);
       if (item.status === "DONE") throw new SpaceConflictError("That item was already reported.");
       await repository.setItemStatus(owner, item.id, "DONE");
       const run = await repository.getActiveRun(pane.id);
-      const counterKey = { replied: "replied", drafted: "drafted", archived: "archived", labeled: "labeled", skipped: "skipped", needs_user: "needsUser", learned: "skipped" }[input.outcome] as keyof MailCopilotRun["counters"];
+      const counterKey = { replied: "replied", drafted: "drafted", archived: "archived", labeled: "labeled", skipped: "skipped", needs_user: "needsUser", learned: "skipped", fixed: "fixed" }[input.outcome] as keyof MailCopilotRun["counters"];
       if (run && run.ownerUserId === owner) await repository.updateRun(owner, run.id, { counters: { ...run.counters, [counterKey]: run.counters[counterKey] + 1 }, currentEventId: null, lastActivityAt: now() });
-      const type: MailCopilotEventType = { replied: "REPLIED", drafted: "DRAFTED", archived: "ARCHIVED", labeled: "LABELED", skipped: "SKIPPED", needs_user: "NEEDS_USER", learned: "TRIAGED" }[input.outcome] as MailCopilotEventType;
+      const type: MailCopilotEventType = { replied: "REPLIED", drafted: "DRAFTED", archived: "ARCHIVED", labeled: "LABELED", skipped: "SKIPPED", needs_user: "NEEDS_USER", learned: "TRIAGED", fixed: "FIXED" }[input.outcome] as MailCopilotEventType;
       await repository.touchMemories(owner, input.memoryIds);
-      return record(owner, { paneId: pane.id, runId: run?.id ?? null, type, accountEmail: item.accountEmail, threadId: item.threadId, messageId: item.messageId, message: input.summary, payload: { itemId: item.id, outcome: input.outcome, memoryIds: input.memoryIds } });
+      // A fixed hand-off teaches the copilot how this kind of mail is fixed, with what the operator asked and decided.
+      const lesson = item.type === "FIX_REQUESTED" && input.outcome === "fixed" ? await rememberFix(owner, item, input.summary).catch(() => null) : null;
+      return record(owner, { paneId: pane.id, runId: run?.id ?? null, type, accountEmail: item.accountEmail, threadId: item.threadId, messageId: item.messageId, message: input.summary,
+        payload: { itemId: item.id, outcome: input.outcome, memoryIds: input.memoryIds, ...(lesson ? { lessonMemoryId: lesson.id } : {}) } });
     },
     // ---- questions and reviews ---------------------------------------------------------------
     async askQuestion(owner: string, pane: Pane, input: { question: string; options?: string[]; accountEmail?: string; threadId?: string }) {
+      // The same question still open in this pane (an agent's retry) is the same card, never a second one.
+      const open = (await this.pendingItems(owner, pane.id)).find((item) => item.kind === "QUESTION" && item.payload.question === input.question && item.threadId === (input.threadId ?? null));
+      if (open) return { questionId: open.id, answered: false as const };
       const questionId = `mailq:${randomBytes(9).toString("base64url")}`;
       await record(owner, { paneId: pane.id, type: "QUESTION", accountEmail: input.accountEmail ?? null, threadId: input.threadId ?? null, message: `Needs you: ${input.question}`,
         payload: { questionId, question: input.question, options: input.options ?? [] } });
       return { questionId, answered: false as const };
     },
-    async answerQuestion(owner: string, pane: Pane, input: { questionId: string; answer: string }) {
+    /** by NOUS: Nous, the mind of SpaceApp, answered for the operator (its answer is the agent's memory, not the operator's voice). */
+    async answerQuestion(owner: string, pane: Pane, input: { questionId: string; answer: string }, by: "USER" | "NOUS" = "USER") {
       const events = await repository.listEvents(owner, { types: ["QUESTION"], limit: 300 });
       const question = events.find((event) => event.payload.questionId === input.questionId);
       if (!question) throw new SpaceNotFoundError("The question was not found.");
       const memory = await repository.upsertMemory({ ownerUserId: owner, kind: "FACT", key: String(question.payload.question).toLowerCase().slice(0, 300), text: input.answer, contactEmail: null,
-        domain: null, accountEmail: null, tags: ["question"], source: "USER", confidence: 0.9, pinned: false });
-      await record(owner, { paneId: pane.id, type: "ANSWERED", accountEmail: question.accountEmail, threadId: question.threadId, message: `You answered: ${input.answer.slice(0, 200)}`, payload: { questionId: input.questionId, answer: input.answer, memoryId: memory.id } });
+        domain: null, accountEmail: null, tags: ["question"], source: by === "NOUS" ? "AGENT" : "USER", confidence: 0.9, pinned: false });
+      await record(owner, { paneId: pane.id, type: "ANSWERED", accountEmail: question.accountEmail, threadId: question.threadId, message: `${by === "NOUS" ? "Nous" : "You"} answered: ${input.answer.slice(0, 200)}`, payload: { questionId: input.questionId, answer: input.answer, memoryId: memory.id, answeredBy: by } });
       return { memory };
     },
     async waitForAnswer(owner: string, input: { questionId: string; waitMs: number }) {
@@ -789,7 +914,22 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
         message: `Review: ${input.summary}`, payload: { reviewId, draft: input.draft, reasoning: input.reasoning ?? null } });
       return { reviewId };
     },
+    /**
+     * One decision and one Gmail send per review (stable 2026-10-17: one approval went to Hetzner twice, 9 s apart): a decided
+     * review answers its recorded decision, and a decision already running is shared by the calls that arrive meanwhile.
+     * shortcut: the in-flight guard is per process; the API runs one, a second process would need a database claim.
+     */
     async decideReview(owner: string, pane: Pane, input: MailCopilotReviewDecision) {
+      const key = `${owner}\u0000${input.reviewId}`;
+      const running = deciding.get(key);
+      if (running) return running;
+      const decision = this.decideReviewOnce(owner, pane, input).finally(() => deciding.delete(key));
+      deciding.set(key, decision);
+      return decision;
+    },
+    async decideReviewOnce(owner: string, pane: Pane, input: MailCopilotReviewDecision) {
+      const decided = (await repository.listEvents(owner, { types: ["REVIEW_DECIDED"], limit: 300 })).find((event) => event.payload.reviewId === input.reviewId);
+      if (decided) return { decision: decided.payload.decision as MailCopilotReviewDecision["decision"], sent: (decided.payload.sent ?? null) as { messageId: string; threadId: string } | null };
       const review = (await repository.listEvents(owner, { types: ["REVIEW_REQUESTED"], limit: 300 })).find((event) => event.payload.reviewId === input.reviewId);
       if (!review) throw new SpaceNotFoundError("The review was not found.");
       const draft = review.payload.draft as MailComposeInput;
@@ -872,6 +1012,8 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
           }
         } while (pageToken);
         let created = 0;
+        // New mail like the mail the operator keeps sending to the copilot to fix goes to the copilot on its own (a learned or written FIX rule).
+        const fixRules = added.size ? (await repository.listRules(owner, { status: ["APPROVED"], accountEmail: email })).filter((rule) => rule.action.type === "FIX" && (rule.accountEmail === null || rule.accountEmail === email)) : [];
         for (const { id, threadId } of added.values()) {
           const seen = await repository.listEvents(owner, { accountEmail: email, threadId, types: ["MAIL_RECEIVED"], limit: 50 });
           if (seen.some((event) => event.messageId === id)) continue;
@@ -879,9 +1021,15 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
           const facts = ruleSubject(message);
           const from = parseParticipants(facts.from)[0] ?? { name: "", address: "" };
           const automated = AUTOMATED_SENDER.test(from.address);
-          await record(owner, { paneId: pane.id, type: "MAIL_RECEIVED", status: automated ? null : "PENDING", accountEmail: email, threadId, messageId: id,
+          const fixRule = fixRules.find((rule) => mailRuleMatches(rule.condition, facts));
+          await record(owner, { paneId: pane.id, type: "MAIL_RECEIVED", status: automated || fixRule ? null : "PENDING", accountEmail: email, threadId, messageId: id,
             message: `New mail: ${facts.subject || "(no subject)"} from ${from.name || from.address}`,
             payload: { from, subject: facts.subject, snippet: decodeEntities(String(message.snippet ?? "")).slice(0, 500), labelIds: facts.labelIds, receivedAt: iso(message.internalDate), automated } });
+          if (fixRule) {
+            await this.requestFix(owner, pane, { account: email, threadId, messageId: id, by: "rule", ruleId: fixRule.id, ruleName: fixRule.name, facts });
+            fixRule.appliedCount += 1;
+            await repository.updateRule(owner, fixRule.id, { appliedCount: fixRule.appliedCount, lastAppliedAt: now() });
+          }
           created += 1;
         }
         const learned = await learnFromHistory(owner, email, client, entries, pane.id) + await backfill();
@@ -897,8 +1045,112 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
         throw gmailError(email, error);
       }
     },
+    /**
+     * "Send to AI": one conversation goes to the copilot to check and fix what it needs. The hand-off is an action of
+     * the log (the operator's, so the copilot learns it; a learned FIX rule's own hand-offs are the copilot's) and a
+     * FIX_REQUESTED work item; the run starts on its own when the pane can take it.
+     */
+    async requestFix(owner: string, pane: Pane, input: MailCopilotFixRequest & { by?: "operator" | "rule"; ruleId?: string; ruleName?: string; facts?: MailRuleSubject | null; messageId?: string }): Promise<{ event: MailCopilotEvent; runStarted: boolean }> {
+      await mailAccounts(owner, pane, input.account);
+      const by = input.by ?? "operator";
+      const facts = input.facts !== undefined ? input.facts : await clientFor(owner, input.account).then((client) => client.thread(input.threadId, "metadata")).then((thread) => {
+        const message = correspondent((thread.messages as GmailJson[] | undefined) ?? [], input.account);
+        return message ? ruleSubject(message) : null;
+      }, (error: unknown) => { throw gmailError(input.account, error); });
+      const row = await logAction(owner, { accountEmail: input.account, threadId: input.threadId, messageId: input.messageId ?? null, action: "FIX", facts,
+        actor: by === "operator" ? "OPERATOR" : "AGENT", source: by === "operator" ? "PANE" : "SPACE", ruleId: input.ruleId ?? null });
+      if (row && by === "operator") await learnRules(owner, row, pane.id).catch(() => undefined);
+      await closeHandledItems(owner, input.account, input.threadId).catch(() => undefined);
+      const from = facts ? parseParticipants(facts.from)[0] ?? null : null;
+      const subject = facts?.subject || "(no subject)";
+      const event = await record(owner, { paneId: pane.id, type: "FIX_REQUESTED", status: "PENDING", accountEmail: input.account, threadId: input.threadId, messageId: input.messageId ?? null,
+        message: by === "operator" ? `You sent to the copilot to check and fix: ${subject}` : `Sent to the copilot to check and fix (rule "${input.ruleName ?? input.ruleId}"): ${subject}`,
+        payload: { by, ruleId: input.ruleId ?? null, note: input.note ?? null, from, subject } });
+      return { event, runStarted: await this.autostart(owner, pane).catch(() => false) };
+    },
+    /** Starts the pane's run for work nobody pressed Start for, when the pane is not paused, no run is paused and its CLI can take the kickoff. */
+    async autostart(owner: string, pane: Pane): Promise<boolean> {
+      // Hand-offs sent back to back share one start: a second kickoff would type the run's prompt into the CLI twice.
+      const pending = starting.get(pane.id);
+      if (pending) return pending;
+      const start = this.startOnce(owner, pane).finally(() => starting.delete(pane.id));
+      starting.set(pane.id, start);
+      return start;
+    },
+    async startOnce(owner: string, pane: Pane): Promise<boolean> {
+      if (!options.kickoff || paneSettings(pane).paused) return false;
+      const active = await repository.getActiveRun(pane.id);
+      if (active?.status === "PAUSED" || (active && active.ownerUserId !== owner) || !(await options.kickoff.ready(pane))) return false;
+      const started = await this.startRun(owner, pane.id);
+      if (started.kickoff || Date.parse(now()) - Date.parse(started.run.lastActivityAt) >= RUN_IDLE_MS) {
+        await options.kickoff.send(pane, started.run);
+        await this.markKickoff(owner, started.run.id);
+      }
+      return true;
+    },
+    /**
+     * The daily organize run (operator 2026-10-27): once a day from the pane's `dailyRunHour` in the owner's time zone,
+     * when the pane is not paused and its CLI can take the kickoff, the whole inbox is scanned and the run starts.
+     */
+    async dailyRun(owner: string, pane: Pane, timeZone: string): Promise<boolean> {
+      const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hourCycle: "h23" })
+        .formatToParts(new Date(now())).map((part) => [part.type, part.value]));
+      const day = `${parts.year}-${parts.month}-${parts.day}`;
+      if (Number(parts.hour) < paneSettings(pane).dailyRunHour || paneSettings(pane).paused || !options.kickoff) return false;
+      const marks = await repository.listEvents(owner, { paneId: pane.id, types: ["NOTE"], since: new Date(Date.parse(now()) - 48 * 3_600_000).toISOString(), limit: 500 });
+      if (marks.some((event) => event.payload.dailyRun === day)) return false;
+      const active = await repository.getActiveRun(pane.id);
+      if (active?.status === "PAUSED") return false;
+      // The pane always runs (operator 2026-10-27): a stopped CLI is started first and the pass waits for its prompt.
+      if (options.kickoff.startCli && options.kickoff.cliRunning && !(await options.kickoff.cliRunning(pane))) { await options.kickoff.startCli(pane); return false; }
+      if (!(await options.kickoff.ready(pane))) return false;
+      // The mark goes first: a failed scan is not retried every minute, and the run still takes the usual backlog.
+      const mark = await record(owner, { paneId: pane.id, type: "NOTE", message: `Daily organize run ${day}: the whole inbox`, payload: { dailyRun: day } });
+      await this.scanBacklog(owner, pane, active?.id ?? null, true).catch((error: unknown) => record(owner, { paneId: pane.id, type: "NOTE",
+        message: `Daily inbox scan failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 1000), payload: { dailyRunOf: mark.id } }));
+      return this.autostart(owner, pane);
+    },
+    /** New mail that made work items starts the pane's run on its own (operator 2026-10-27: the pane always runs). */
+    async startForNewMail(owner: string, pane: Pane): Promise<boolean> {
+      return (await repository.countPendingItems(owner)) > 0 && this.autostart(owner, pane);
+    },
     syncState: (owner: string, email: string) => repository.getSyncState(owner, email),
-    /** The Memory tab's "Learned habits": per account of the pane, the senders the operator handled most, newest first among equals. */
+    /** Every mail sent to the copilot to fix (Activity → Sent to AI), newest first: the request, the questions and answers, and the result. */
+    async fixRequests(owner: string, pane: Pane | null, limit = 50): Promise<MailFixRequestView[]> {
+      const accounts = await mailAccounts(owner, pane, "all");
+      const requests = (await repository.listEvents(owner, { types: ["FIX_REQUESTED"], limit: 200 })).filter((event) => !event.accountEmail || accounts.includes(event.accountEmail)).slice(0, limit);
+      if (!requests.length) return [];
+      const since = requests.at(-1)!.createdAt;
+      const [reports, questions, answers] = await Promise.all([
+        repository.listEvents(owner, { types: ["FIXED", "NEEDS_USER", "SKIPPED", "REPLIED", "DRAFTED", "ARCHIVED", "LABELED", "TRIAGED"], since, limit: 500 }),
+        repository.listEvents(owner, { types: ["QUESTION"], since, limit: 500 }),
+        repository.listEvents(owner, { types: ["ANSWERED"], since, limit: 500 })
+      ]);
+      return requests.map((request) => {
+        const report = reports.find((event) => event.payload.itemId === request.id) ?? null;
+        const from = request.payload.from as { address?: string } | null | undefined;
+        return {
+          id: request.id, account: request.accountEmail, threadId: request.threadId, subject: String(request.payload.subject ?? "(no subject)"), from: from?.address ?? null,
+          note: typeof request.payload.note === "string" ? request.payload.note : null, by: request.payload.by === "rule" ? "rule" as const : "operator" as const,
+          status: (request.status ?? "DONE") as MailFixRequestView["status"], requestedAt: request.createdAt,
+          exchanges: exchangesFor(request, report?.createdAt ?? null, questions, answers),
+          outcome: report ? { type: report.type, summary: report.message, at: report.createdAt } : null,
+          memoryId: typeof report?.payload.lessonMemoryId === "string" ? report.payload.lessonMemoryId : null
+        };
+      });
+    },
+    /** The action log as the operator reads it back (Activity → Your actions), newest first, for the pane's accounts. */
+    /** Replies and forwards logged on one thread since a time (Nous's double-send guard, queue item 27). */
+    threadReplies: (owner: string, account: string, threadId: string, since: string) =>
+      repository.listActions(owner, { accountEmail: account.toLowerCase(), threadId, actions: ["REPLY", "FORWARD"], since, limit: 5 }),
+    async actionLog(owner: string, pane: Pane | null, input: { account?: string; source?: MailActionRecord["source"]; limit: number }): Promise<MailActionLogEntry[]> {
+      const accounts = await mailAccounts(owner, pane, input.account ?? "all");
+      const rows = (await repository.listActions(owner, { accountEmail: input.account, sources: input.source ? [input.source] : undefined, limit: input.account ? input.limit : 500 }))
+        .filter((row) => accounts.includes(row.accountEmail)).slice(0, input.limit);
+      const names = new Map(await Promise.all([...new Set(rows.map((row) => row.accountEmail))].map(async (account) => [account, await labelNames(owner, account, rows.filter((row) => row.accountEmail === account))] as const)));
+      return rows.map((row) => ({ ...row, labelNames: row.labelIds.map((label) => names.get(row.accountEmail)?.get(label) ?? label) }));
+    },
+    /** The Memory tab's "Learned habits": per account of the pane, the senders whose mail the operator handled themselves first (most, then newest), then the inferred ones. */
     async habitList(owner: string, pane: Pane | null): Promise<MailHabitSender[]> {
       const accounts = await mailAccounts(owner, pane, "all");
       const since = new Date(Date.parse(now()) - HABIT_WINDOW_MS).toISOString();
@@ -910,7 +1162,7 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
         return [...bySender].map(([sender, senderRows]): MailHabitSender => {
           const level = habitLevel("sender", sender, senderRows, names)!;
           return { account, sender, summary: habitWords(level, 3), level, lastAt: senderRows[0]!.occurredAt };
-        }).sort((left, right) => (right.level.decisions || right.level.actions.length) - (left.level.decisions || left.level.actions.length) || right.lastAt.localeCompare(left.lastAt)).slice(0, 50);
+        }).sort((left, right) => observedOf(right) - observedOf(left) || right.lastAt.localeCompare(left.lastAt)).slice(0, 50);
       });
       return perAccount.flat();
     },
@@ -947,7 +1199,7 @@ export function createMailCopilotService(options: MailCopilotServiceOptions) {
     now
   };
   function summarize(counters: MailCopilotRun["counters"]): string {
-    return `${counters.taken} taken, ${counters.replied} replied, ${counters.drafted} drafted, ${counters.archived} archived, ${counters.skipped} skipped, ${counters.needsUser} need you`;
+    return `${counters.taken} taken, ${counters.replied} replied, ${counters.drafted} drafted, ${counters.archived} archived, ${counters.fixed} fixed, ${counters.skipped} skipped, ${counters.needsUser} need you`;
   }
 }
 export type MailCopilotService = ReturnType<typeof createMailCopilotService>;

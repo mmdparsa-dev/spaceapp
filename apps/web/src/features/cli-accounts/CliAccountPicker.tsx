@@ -6,12 +6,14 @@ import {
   cliAccountAvailability,
   cliAccountPlan,
   cliAccountPool,
+  cliAccountWeeklyForecast,
   type CliAccountAvailability,
   type CliAccountMenuRuntimeId,
 } from "./cli-account-availability.js";
 import { accountColorStyle, CliAccountAvatar, CliAccountColorLegend, CliAccountMeter } from "./CliAccountVisuals.js";
 import { useCliAccountBalance } from "./cli-account-balance.js";
 import { useCliAccountSignals } from "./use-cli-account-signals.js";
+import { useOptionalVoiceInput } from "../voice-input/VoiceInputProvider.js";
 
 interface CliAccountPickerProps {
   runtimeId: CliAccountMenuRuntimeId;
@@ -40,9 +42,14 @@ const minimumMenuHeightPx = 150;
 // Space between the menu and the pane's left edge when the pane is narrower than the menu.
 const menuEdgeGapPx = 8;
 
+// Settings → CLI pane controls → Account picker hides the button; hidden, the menu never mounts or polls quota.
+export function CliAccountPicker(props: CliAccountPickerProps) {
+  return useOptionalVoiceInput()?.settings.terminalAccountPicker === false ? null : <AccountPickerMenu {...props} />;
+}
+
 // One click on the trigger lists every account of this CLI with its availability; one
 // more click switches the pane. The active account is marked in the list and named in the tooltip.
-export function CliAccountPicker({
+function AccountPickerMenu({
   runtimeId,
   providerLabel,
   icon,
@@ -84,6 +91,7 @@ export function CliAccountPicker({
   }), [balance, clock, identities, modelGroup, profiles, quota, runtimeId]);
   // Codex: the ChatGPT accounts Space Gateway picks from, listed for their quota; they cannot be chosen one by one.
   const pool = useMemo(() => cliAccountPool(runtimeId, quota, clock), [clock, quota, runtimeId]);
+  const forecast = useMemo(() => (open ? cliAccountWeeklyForecast(runtimeId, quota, clock, modelGroup) : null), [clock, modelGroup, open, quota, runtimeId]);
   const activeRow = Math.max(0, rows.findIndex((row) => row.profile.profileId === selectedProfileId));
   const active = rows[activeRow];
   // The Auto entry, when offered, comes first in the menu; item refs and keyboard moves count it.
@@ -228,6 +236,16 @@ export function CliAccountPicker({
                 {modelGroup ? ` · ${modelGroup === "gemini" ? "Gemini" : "Claude · GPT"} quota` : ""}
               </small>
             </span>
+            {forecast ? (
+              <span
+                className="cli-account-menu-forecast"
+                style={{ color: forecast.color }}
+                title={`At this week's pace, ${Math.round(forecast.percent)}% of the weekly quota of ${forecast.accounts} subscription ${forecast.accounts === 1 ? "account" : "accounts"} is still free when the last of their weeks resets ${forecast.resetWhen}. API keys are not counted.`}
+              >
+                <strong>{Math.round(forecast.percent)}%</strong>
+                <small>free {forecast.resetWhen}</small>
+              </span>
+            ) : null}
           </div>
           <div className="cli-account-menu-list" style={menuMaxHeight ? { maxHeight: `${menuMaxHeight - 82}px` } : undefined}>
             {auto ? (
@@ -263,7 +281,8 @@ export function CliAccountPicker({
             {rows.map((row, rowIndex) => {
               const index = rowIndex + offset;
               const isActive = index === activeIndex;
-              const inUse = Boolean(auto?.active) && rowIndex === activeRow;
+              const inUse = (Boolean(auto?.active) && rowIndex === activeRow)
+                || (selectedProfileId === "space-gateway" && row.availability.gatewayInUse === true);
               return (
                 <button
                   key={row.profile.profileId}
