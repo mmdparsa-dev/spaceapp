@@ -1,6 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
-import { extname, join, relative, resolve } from "node:path";
+import { extname, join, relative, resolve, sep } from "node:path";
 import type {
   DemoCatalogResponse,
   DemoConnection,
@@ -252,7 +252,7 @@ export class DemoProjectsService {
     if (!variant) throw new DemoRunError("DEMO_VARIANT_UNKNOWN", "The requested demo variant is not in the catalog.", 404);
     const templateDirectory = resolveTemplateDirectory(this.options.demoRoot, variant);
     const absolute = resolve(templateDirectory, inputPath);
-    if (!absolute.startsWith(`${resolve(templateDirectory)}/`)) {
+    if (!absolute.startsWith(`${resolve(templateDirectory)}${sep}`)) {
       throw new DemoRunError("DEMO_FILE_OUTSIDE_TEMPLATE", "Only files inside the variant template can be read.", 400);
     }
     const info = await stat(absolute).catch(() => null);

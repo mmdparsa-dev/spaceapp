@@ -1,6 +1,6 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { chmod, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 const keyLengthBytes = 32;
 const ivLengthBytes = 12;
@@ -20,7 +20,7 @@ export class DemoCredentialStore {
   private cachedKey: Buffer | null = null;
 
   constructor(private readonly root: string) {
-    if (!root.startsWith("/")) throw new Error("The demo credential root must be an absolute path.");
+    if (!root.startsWith("/") && !isAbsolute(root)) throw new Error("The demo credential root must be an absolute path.");
     this.credentialDirectory = join(root, "credentials");
   }
 
